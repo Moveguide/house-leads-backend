@@ -4,6 +4,7 @@
   "main": "api/whatsapp.js",
   "dependencies": {
     "neo4j-driver": "^5.12.0",
+    "openai": "^4.28.0",
     "twilio": "^4.19.0"
   },
   "type": "module"
