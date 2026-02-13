@@ -1,7 +1,6 @@
 import neo4j from 'neo4j-driver';
 import OpenAI from 'openai';
 
-// Initialize AI and Database
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const driver = neo4j.driver(
   process.env.NEO4J_URI,
@@ -10,26 +9,47 @@ const driver = neo4j.driver(
 );
 
 export default async function handler(req, res) {
-  // 1. Safety Check: Only allow POST (Twilio)
-  if (req.method !== 'POST') {
-    return res.status(405).send('Method Not Allowed');
-  }
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   const { Body, From, MessageSid, NumMedia, MediaUrl0 } = req.body;
   const session = driver.session();
+  const cleanBody = (Body || "").trim().toLowerCase();
 
   try {
-    let aiExtracted = { address: null, phone: null };
-    let isImage = parseInt(NumMedia) > 0;
+    // 1. Check if the user is answering the "Role" question
+    const isDeclaringLandlord = cleanBody.includes("landlord") || cleanBody.includes("owner");
+    const isDeclaringManager = cleanBody.includes("manager") || cleanBody.includes("caretaker");
 
-    // 2. If it's text, extract details using AI
+    if (isDeclaringLandlord || isDeclaringManager) {
+      const role = isDeclaringLandlord ? "Landlord" : "Property Manager";
+      await session.executeWrite(tx =>
+        tx.run('MERGE (p:Person { whatsapp: $sender }) SET p.role = $role', { sender: From, role })
+      );
+
+      return sendTwiML(res, `Got it, you are registered as a ${role}. Now, please send the address of the vacancy you want us to inspect.`);
+    }
+
+    // 2. Check if we already know this person's role
+    const personResult = await session.run(
+      'MATCH (p:Person {whatsapp: $sender}) RETURN p.role AS role',
+      { sender: From }
+    );
+    const userRole = personResult.records[0]?.get('role');
+
+    // 3. If no role is found, ask the question first
+    if (!userRole) {
+      return sendTwiML(res, "Welcome! To help us process your listing, are you the Landlord or the Property Manager?");
+    }
+
+    // 4. Role exists! Proceed with AI Extraction for the Property
+    let aiExtracted = { address: null, phone: null };
     if (Body && Body.length > 5) {
       const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           { 
             role: "system", 
-            content: "Extract the property address and contact phone number from this message. Return ONLY JSON: { \"address\": \"string\", \"phone\": \"string\" }. If information is missing, use null." 
+            content: "Extract the property address and contact phone number. Return ONLY JSON: { \"address\": \"string\", \"phone\": \"string\" }." 
           },
           { role: "user", content: Body }
         ],
@@ -38,69 +58,56 @@ export default async function handler(req, res) {
       aiExtracted = JSON.parse(completion.choices[0].message.content);
     }
 
-    // 3. Database Operation: Graph Linking
-    // We link the Person to the Property and store the NIN/Utility bill image if provided
+    // 5. Save the Lead for the Field Agent
     const query = `
-      MERGE (p:Person { whatsapp: $sender })
-      
-      // We use the extracted address as the unique ID for the property
+      MATCH (p:Person { whatsapp: $sender })
       MERGE (prop:Property { address: $address })
       ON CREATE SET 
-        prop.extractedPhone = $phone,
-        prop.verified = false,
-        prop.status = 'Pending'
-
-      // Create the relationship (The Lead)
+        prop.status = 'Pending_Inspection',
+        prop.verified = false
+      
       CREATE (p)-[r:LISTED { id: $msgId }]->(prop)
       SET 
         r.originalText = $text,
         r.evidenceImage = $imageLink,
         r.createdAt = datetime(),
-        r.hasMedia = $hasMedia
+        r.roleAtTimeOfListing = p.role
         
-      RETURN p, prop
+      RETURN prop
     `;
 
-    await session.executeWrite(tx => 
-      tx.run(query, { 
-        sender: From, 
-        address: aiExtracted.address || "Unknown/Pending", 
+    await session.executeWrite(tx =>
+      tx.run(query, {
+        sender: From,
+        address: aiExtracted.address || "Unknown/Address Pending",
         phone: aiExtracted.phone || From,
-        text: Body || "",
+        text: Body,
         imageLink: MediaUrl0 || null,
-        msgId: MessageSid,
-        hasMedia: isImage
+        msgId: MessageSid
       })
     );
 
-    // 4. Smart Response Logic
-    let responseMessage = "";
-    if (isImage) {
-      responseMessage = "Thank you for the document! Our agents will verify your NIN/Utility bill and update your listing status shortly.";
-    } else if (aiExtracted.address) {
-      responseMessage = `Got it! To list "${aiExtracted.address}", please reply with a photo of your NIN or Utility Bill for verification.`;
-    } else {
-      responseMessage = "Thanks for reaching out! Please send the property address and a photo of your NIN to get started.";
-    }
+    // 6. Final Response
+    const responseMsg = aiExtracted.address 
+      ? `Received! We've logged the vacancy at ${aiExtracted.address}. A field agent will contact you shortly for inspection and to verify bank details.`
+      : "Thanks! We've received your message. Please ensure you've sent the full address so our field agent can schedule an inspection.";
 
-    // 5. Send TwiML response back to Twilio
-    res.setHeader('Content-Type', 'text/xml');
-    return res.status(200).send(`
-      <Response>
-        <Message>${responseMessage}</Message>
-      </Response>
-    `);
+    return sendTwiML(res, responseMsg);
 
   } catch (error) {
-    console.error("Critical Error:", error);
-    // Fallback response so the user isn't left hanging
-    res.setHeader('Content-Type', 'text/xml');
-    return res.status(200).send(`
-      <Response>
-        <Message>Message received! Our system is a bit busy, but an agent will review your request manually soon.</Message>
-      </Response>
-    `);
+    console.error("Error:", error);
+    return sendTwiML(res, "Message received! We're having a technical hiccup, but our team will review your message manually.");
   } finally {
     await session.close();
   }
+}
+
+// Helper function to keep code clean
+function sendTwiML(res, message) {
+  res.setHeader('Content-Type', 'text/xml');
+  return res.status(200).send(`
+    <Response>
+      <Message>${message}</Message>
+    </Response>
+  `);
 }
