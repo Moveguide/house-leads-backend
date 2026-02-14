@@ -72,8 +72,9 @@ export default async function handler(req, res) {
       MATCH (p:Person { whatsapp: $sender })
       MERGE (prop:Property { address: $address })
       ON CREATE SET 
-        prop.status = 'Pending_Inspection',
-        prop.verified = false
+      prop.status = 'Pending_Inspection',
+      prop.verified = false,
+      prop.synced = false
       
       CREATE (p)-[r:LISTED { id: $msgId }]->(prop)
       SET 
