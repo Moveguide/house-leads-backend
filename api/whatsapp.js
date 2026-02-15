@@ -102,19 +102,15 @@ export default async function handler(req, res) {
     );
 
     // --- MIRROR TO SUPABASE INSPECTIONS TABLE ---
-  const { error: supabaseError } = await supabase
+    const { error: supabaseError } = await supabase
     .from('inspections')
     .insert([
       { 
-        address: finalAddress, // The address from AI
-        landlord_phone: From,  // The sender's WhatsApp number
-        inspection_type: 'house',
-        status: 'assigned',    // This ensures it shows up in your "Assigned" tab
-        landlord_name: 'Pending Verification',
-        // user_id: 'PASTE_YOUR_AUTH_USER_ID_HERE' 
+        address: finalAddress,
+        status: 'assigned', // Keep this as 'assigned' so it shows in your current app tab
+        user_id: null       // LEAVE THIS NULL. It goes into the "Pool."
       }
     ]);
-
 
     if (supabaseError) console.error("Supabase Save Error:", supabaseError);
     // -------------------------------
