@@ -1,5 +1,6 @@
 import neo4j from 'neo4j-driver';
 import OpenAI from 'openai';
+import { createClient } from '@supabase/supabase-js'; // Added Supabase import
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const driver = neo4j.driver(
@@ -8,11 +9,16 @@ const driver = neo4j.driver(
   { disableLosslessIntegers: true }
 );
 
+// Initialize Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // Or your specific Lovable URL
+  res.setHeader('Access-Control-Allow-Origin', '*'); 
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  
   
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
@@ -25,7 +31,6 @@ export default async function handler(req, res) {
   const cleanBody = (Body || "").trim().toLowerCase();
 
   try {
-    // 1. Check if the user is answering the "Role" question
     const isDeclaringLandlord = cleanBody.includes("landlord") || cleanBody.includes("owner");
     const isDeclaringManager = cleanBody.includes("manager") || cleanBody.includes("caretaker");
 
@@ -38,19 +43,16 @@ export default async function handler(req, res) {
       return sendTwiML(res, `Got it, you are registered as a ${role}. Now, please send the address of the vacancy you want us to inspect.`);
     }
 
-    // 2. Check if we already know this person's role
     const personResult = await session.run(
       'MATCH (p:Person {whatsapp: $sender}) RETURN p.role AS role',
       { sender: From }
     );
     const userRole = personResult.records[0]?.get('role');
 
-    // 3. If no role is found, ask the question first
     if (!userRole) {
       return sendTwiML(res, "Welcome! To help us process your listing, are you the Landlord or the Property Manager?");
     }
 
-    // 4. Role exists! Proceed with AI Extraction for the Property
     let aiExtracted = { address: null, phone: null };
     if (Body && Body.length > 5) {
       const completion = await openai.chat.completions.create({
@@ -67,7 +69,9 @@ export default async function handler(req, res) {
       aiExtracted = JSON.parse(completion.choices[0].message.content);
     }
 
-    // 5. Save the Lead for the Field Agent
+    const finalAddress = aiExtracted.address || "Unknown/Address Pending";
+
+    // 5. Save the Lead for the Field Agent (Neo4j)
     const query = `
       MATCH (p:Person { whatsapp: $sender })
       MERGE (prop:Property { address: $address })
@@ -89,7 +93,7 @@ export default async function handler(req, res) {
     await session.executeWrite(tx =>
       tx.run(query, {
         sender: From,
-        address: aiExtracted.address || "Unknown/Address Pending",
+        address: finalAddress,
         phone: aiExtracted.phone || From,
         text: Body,
         imageLink: MediaUrl0 || null,
@@ -97,7 +101,21 @@ export default async function handler(req, res) {
       })
     );
 
-    // 6. Final Response
+    // --- ADDED: SAVE TO SUPABASE ---
+    const { error: supabaseError } = await supabase
+      .from('properties')
+      .insert([
+        { 
+          address: finalAddress, 
+          status: 'Pending_Inspection',
+          whatsapp_number: From,
+          image_url: MediaUrl0 || null
+        }
+      ]);
+
+    if (supabaseError) console.error("Supabase Save Error:", supabaseError);
+    // -------------------------------
+
     const responseMsg = aiExtracted.address 
       ? `Received! We've logged the vacancy at ${aiExtracted.address}. A field agent will contact you shortly for inspection and to verify bank details.`
       : "Thanks! We've received your message. Please ensure you've sent the full address so our field agent can schedule an inspection.";
@@ -112,7 +130,6 @@ export default async function handler(req, res) {
   }
 }
 
-// Helper function to keep code clean
 function sendTwiML(res, message) {
   res.setHeader('Content-Type', 'text/xml');
   return res.status(200).send(`
