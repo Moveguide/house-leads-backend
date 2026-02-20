@@ -13,40 +13,36 @@ export default async function handler(req, res) {
   const senderPhone = (From || "").replace('whatsapp:', '');
 
   try {
-    // 1. FETCH DATA - Use .eq() correctly
-    const { data: existing } = await supabase
+    // 1. FETCH ALL DATA FOR THIS PHONE
+    const { data: records } = await supabase
       .from('inspections')
       .select('*')
-      .eq('landlord_phone', senderPhone)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .eq('landlord_phone', senderPhone);
+    
+    // Find the current state of this user
+    const knownName = records?.find(r => r.landlord_name && r.landlord_name !== "COMPLETED")?.landlord_name;
+    const knownIDRecord = records?.find(r => r.nin_number || r.cac_number);
+    const latestListing = records?.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0] || {};
 
-    // 2. DETERMINE THE CURRENT STEP (Force the AI to see the checklist)
-    const nameStatus = existing?.landlord_name ? "COMPLETED" : "MISSING";
-    const addressStatus = existing?.address && existing.address !== "Pending" ? "COMPLETED" : "MISSING";
-    const idStatus = (existing?.nin_number || existing?.cac_number) ? "COMPLETED" : "MISSING";
-    const prefStatus = (existing?.landlord_preferences && Object.keys(existing.landlord_preferences).length > 0) ? "COMPLETED" : "MISSING";
+    // 2. LOGIC: Determine exactly what we are looking for
+    let currentGoal = "NAME";
+    if (knownName) currentGoal = "ADDRESS";
+    if (knownName && latestListing.address && latestListing.address !== "Pending") currentGoal = "ID";
+    if (knownName && latestListing.address && (knownIDRecord?.nin_number || knownIDRecord?.cac_number)) currentGoal = "PREFERENCES";
 
-    // 3. AI INTERVIEWER
+    // 3. AI: Only extract the specific goal
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         { 
           role: "system", 
-          content: `You are a real estate assistant. Follow this checklist STRICTLY:
-          1. NAME: ${nameStatus} (Value: ${existing?.landlord_name || 'None'})
-          2. ADDRESS: ${addressStatus} (Value: ${existing?.address || 'None'})
-          3. ID (NIN/CAC): ${idStatus}
-          4. PREFERENCES: ${prefStatus}
-
-          DIRECTIONS:
-          - If a step is MISSING, extract that info from the user's message.
-          - If the user provides info for a MISSING step, move to the NEXT missing step in your 'reply'.
-          - NEVER ask for info that is already COMPLETED.
-          - NIN must be 11 digits. CAC must start with BN or RC.
+          content: `You are an extractor. The user is trying to provide their ${currentGoal}.
+          - Extract the value. 
+          - If the user is giving an ADDRESS, extract the full location.
+          - If the user is giving an ID, check if it's an 11-digit NIN or a CAC (starts with BN or RC).
+          - Write a short, friendly reply asking for the NEXT step in this sequence: Name -> Address -> NIN/CAC -> Preferences.
           
-          RETURN ONLY JSON: { "landlord_name", "address", "nin", "cac", "preferences", "reply" }` 
+          RETURN ONLY JSON: { "extracted_value": "string", "reply": "string" }` 
         },
         { role: "user", content: cleanBody }
       ],
@@ -54,26 +50,27 @@ export default async function handler(req, res) {
     });
 
     const ai = JSON.parse(completion.choices[0].message.content);
+    const newVal = ai.extracted_value;
 
-    // 4. SMART MERGE (This prevents the loop by keeping existing data if AI misses it)
+    // 4. MAP EXTRACTED DATA TO CORRECT COLUMNS
     const updateData = {
       landlord_phone: senderPhone,
-      landlord_name: ai.landlord_name || existing?.landlord_name,
-      address: ai.address || existing?.address || "Pending",
-      nin_number: ai.nin || existing?.nin_number,
-      cac_number: ai.cac || existing?.cac_number,
-      landlord_preferences: (ai.preferences && Object.keys(ai.preferences).length > 0) ? ai.preferences : existing?.landlord_preferences,
+      landlord_name: currentGoal === "NAME" ? newVal : (knownName || "Unknown"),
+      address: currentGoal === "ADDRESS" ? newVal : (latestListing.address || "Pending"),
+      nin_number: (currentGoal === "ID" && newVal?.length === 11) ? newVal : (knownIDRecord?.nin_number || null),
+      cac_number: (currentGoal === "ID" && (newVal?.startsWith('BN') || newVal?.startsWith('RC'))) ? newVal : (knownIDRecord?.cac_number || null),
+      landlord_preferences: currentGoal === "PREFERENCES" ? newVal : (latestListing.landlord_preferences || {}),
       status: 'assigned'
     };
 
-    // 5. UPSERT
+    // 5. UPSERT TO SUPABASE
     await supabase.from('inspections').upsert(updateData, { onConflict: 'landlord_phone, address' });
 
     return sendTwiML(res, ai.reply);
 
   } catch (e) {
     console.error(e);
-    return sendTwiML(res, "Got that. Please provide the next detail (Name, Address, ID, or Preferences).");
+    return sendTwiML(res, "Thanks! What is the next detail (Name, Address, or ID)?");
   }
 }
 
