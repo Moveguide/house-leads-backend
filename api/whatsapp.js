@@ -53,23 +53,36 @@ export default async function handler(req, res) {
       return sendTwiML(res, "Welcome! To help us process your listing, are you the Landlord or the Property Manager?");
     }
 
-    // --- AI EXTRACTION (EXTENDED FOR NIN/CAC & PREFERENCES) ---
+    // --- 1. FETCH CONTEXT FROM SUPABASE ---
+    const cleanLandlordPhone = (From || "").replace('whatsapp:', '');
+    const { data: existingLead } = await supabase
+      .from('inspections')
+      .select('*')
+      .eq('landlord_phone', cleanLandlordPhone)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    // --- 2. AI EXTRACTION WITH MEMORY ---
     let aiExtracted = { address: null, landlord_name: null, agency_name: null, nin: null, cac: null, preferences: {}, reply: null };
-    if (Body && Body.length > 5) {
+    if (Body && Body.length > 0) {
       const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           { 
             role: "system", 
-            content: `You are a property intake assistant. Extract the following from the conversation:
-            - address: Property location
-            - landlord_name: Full name of owner
-            - agency_name: Business/Agency name
-            - nin: 11-digit National ID (Personal)
-            - cac: Corporate Affairs Commission number (Business)
-            - preferences: { "max_occupants": number, "employment": "string", "pets": "string", "marital_status": "string" }
+            content: `You are a property intake assistant. 
+            WE ALREADY KNOW THIS ABOUT THE USER:
+            - Address: ${existingLead?.address || 'Unknown'}
+            - Landlord Name: ${existingLead?.landlord_name || 'Unknown'}
+            - NIN: ${existingLead?.nin_number || 'Unknown'}
+            - CAC: ${existingLead?.cac_number || 'Unknown'}
 
-            If info is missing, ask for ONE item politely (e.g., 'Could you please provide your NIN or CAC number for verification?').
+            YOUR TASK:
+            1. Extract any NEW info from the message.
+            2. If any core info (Address, Name, or an ID like NIN/CAC) is 'Unknown', politely ask for ONE of them.
+            3. If core info is complete, ask about preferences (pets, occupants, marital status).
+            4. Keep it natural and conversational. Ask ONLY ONE question at a time.
             RETURN ONLY JSON: { "address", "landlord_name", "agency_name", "nin", "cac", "preferences", "reply" }` 
           },
           { role: "user", content: Body }
@@ -79,7 +92,7 @@ export default async function handler(req, res) {
       aiExtracted = JSON.parse(completion.choices[0].message.content);
     }
 
-    const finalAddress = aiExtracted.address || "Unknown/Address Pending";
+    const finalAddress = aiExtracted.address || existingLead?.address || "Unknown/Address Pending";
 
     // 5. Save the Lead for the Field Agent (Neo4j)
     const query = `
@@ -110,31 +123,25 @@ export default async function handler(req, res) {
       })
     );
 
-    // --- MIRROR TO SUPABASE INSPECTIONS TABLE ---
-    const cleanLandlordPhone = (From || "").replace('whatsapp:', '');
-
+    // --- 3. MIRROR TO SUPABASE (UPSERT MODE) ---
     const { error: supabaseError } = await supabase
     .from('inspections')
-    .insert([
-      { 
-        address: finalAddress,
+    .upsert({ 
         landlord_phone: cleanLandlordPhone,
-        landlord_name: aiExtracted.landlord_name || userRole,
-        agency_name: aiExtracted.agency_name,
-        nin_number: aiExtracted.nin,
-        cac_number: aiExtracted.cac,
-        landlord_preferences: aiExtracted.preferences,
+        address: finalAddress,
+        landlord_name: aiExtracted.landlord_name || existingLead?.landlord_name || userRole,
+        agency_name: aiExtracted.agency_name || existingLead?.agency_name,
+        nin_number: aiExtracted.nin || existingLead?.nin_number,
+        cac_number: aiExtracted.cac || existingLead?.cac_number,
+        landlord_preferences: { ...existingLead?.landlord_preferences, ...aiExtracted.preferences },
         status: 'assigned', 
         user_id: null       
-      }
-    ]);
+    }, { onConflict: 'landlord_phone' });
 
     if (supabaseError) console.error("Supabase Save Error:", supabaseError);
     // -------------------------------
 
-    const responseMsg = aiExtracted.reply || (aiExtracted.address 
-      ? `Received! We've logged the vacancy at ${aiExtracted.address}. A field agent will contact you shortly for inspection.`
-      : "Thanks! We've received your message. Please ensure you've sent the full address so our field agent can schedule an inspection.");
+    const responseMsg = aiExtracted.reply || "Thanks! We've received your message and are processing the details.";
 
     return sendTwiML(res, responseMsg);
 
