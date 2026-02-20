@@ -13,33 +13,35 @@ export default async function handler(req, res) {
   const senderPhone = (From || "").replace('whatsapp:', '');
 
   try {
-    // 1. FETCH DATA
+    // 1. FETCH ALL DATA FOR THIS PHONE
     const { data: records } = await supabase
       .from('inspections')
       .select('*')
       .eq('landlord_phone', senderPhone);
     
-    // FIX: Better filtering to ensure we don't pick up "Pending" as a real value
-    const knownName = records?.find(r => r.landlord_name && !["COMPLETED", "Pending", "Unknown"].includes(r.landlord_name))?.landlord_name;
+    // Find the current state of this user
+    const knownName = records?.find(r => r.landlord_name && r.landlord_name !== "COMPLETED")?.landlord_name;
     const knownIDRecord = records?.find(r => r.nin_number || r.cac_number);
     const latestListing = records?.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0] || {};
 
-    // 2. LOGIC: The Goalposts
+    // 2. LOGIC: Determine exactly what we are looking for
     let currentGoal = "NAME";
     if (knownName) currentGoal = "ADDRESS";
-    if (knownName && latestListing.address && !["Pending", "Unknown"].includes(latestListing.address)) currentGoal = "ID";
+    if (knownName && latestListing.address && latestListing.address !== "Pending") currentGoal = "ID";
     if (knownName && latestListing.address && (knownIDRecord?.nin_number || knownIDRecord?.cac_number)) currentGoal = "PREFERENCES";
 
-    // 3. AI EXTRACTION
+    // 3. AI: Only extract the specific goal
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         { 
           role: "system", 
-          content: `You are an extractor. The user is providing their ${currentGoal}.
+          content: `You are an extractor. The user is trying to provide their ${currentGoal}.
           - Extract the value. 
-          - NIN: 11 digits. CAC: Starts with BN or RC.
-          - Write a reply asking for the NEXT step: Name -> Address -> ID -> Preferences.
+          - If the user is giving an ADDRESS, extract the full location.
+          - If the user is giving an ID, check if it's an 11-digit NIN or a CAC (starts with BN or RC).
+          - Write a short, friendly reply asking for the NEXT step in this sequence: Name -> Address -> NIN/CAC -> Preferences.
+          
           RETURN ONLY JSON: { "extracted_value": "string", "reply": "string" }` 
         },
         { role: "user", content: cleanBody }
@@ -50,36 +52,25 @@ export default async function handler(req, res) {
     const ai = JSON.parse(completion.choices[0].message.content);
     const newVal = ai.extracted_value;
 
-    // 4. SMART DATA MAPPING (The Loop Killer)
-    // We only create a payload for the specific field we are updating.
-    // This prevents "NULLing" out your inspection columns.
-    let updateData = {
+    // 4. MAP EXTRACTED DATA TO CORRECT COLUMNS
+    const updateData = {
       landlord_phone: senderPhone,
+      landlord_name: currentGoal === "NAME" ? newVal : (knownName || "Unknown"),
+      address: currentGoal === "ADDRESS" ? newVal : (latestListing.address || "Pending"),
+      nin_number: (currentGoal === "ID" && newVal?.length === 11) ? newVal : (knownIDRecord?.nin_number || null),
+      cac_number: (currentGoal === "ID" && (newVal?.startsWith('BN') || newVal?.startsWith('RC'))) ? newVal : (knownIDRecord?.cac_number || null),
+      landlord_preferences: currentGoal === "PREFERENCES" ? newVal : (latestListing.landlord_preferences || {}),
       status: 'assigned'
     };
 
-    if (currentGoal === "NAME") updateData.landlord_name = newVal;
-    if (currentGoal === "ADDRESS") updateData.address = newVal;
-    if (currentGoal === "ID") {
-      if (newVal?.length === 11) updateData.nin_number = newVal;
-      else updateData.cac_number = newVal;
-    }
-    if (currentGoal === "PREFERENCES") updateData.landlord_preferences = { info: newVal };
-
-    // 5. THE FIX: Targeting the ID
-    // If we have an existing row ID, we use UPDATE. If not, we UPSERT.
-    if (latestListing.id && currentGoal !== "ADDRESS") {
-      // Surgical strike: update ONLY the new info on the existing row
-      await supabase.from('inspections').update(updateData).eq('id', latestListing.id);
-    } else {
-      // Create a new listing or update based on Phone + Address
-      await supabase.from('inspections').upsert(updateData, { onConflict: 'landlord_phone, address' });
-    }
+    // 5. UPSERT TO SUPABASE
+    await supabase.from('inspections').upsert(updateData, { onConflict: 'landlord_phone, address' });
 
     return sendTwiML(res, ai.reply);
 
   } catch (e) {
-    return sendTwiML(res, "Thanks! Please provide the next detail.");
+    console.error(e);
+    return sendTwiML(res, "Thanks! What is the next detail (Name, Address, or ID)?");
   }
 }
 
