@@ -1,6 +1,6 @@
 import neo4j from 'neo4j-driver';
 import OpenAI from 'openai';
-import { createClient } from '@supabase/supabase-js'; 
+import { createClient } from '@supabase/supabase-js';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const driver = neo4j.driver(
@@ -53,14 +53,24 @@ export default async function handler(req, res) {
       return sendTwiML(res, "Welcome! To help us process your listing, are you the Landlord or the Property Manager?");
     }
 
-    let aiExtracted = { address: null, phone: null };
+    // --- AI EXTRACTION (EXTENDED FOR NIN/CAC & PREFERENCES) ---
+    let aiExtracted = { address: null, landlord_name: null, agency_name: null, nin: null, cac: null, preferences: {}, reply: null };
     if (Body && Body.length > 5) {
       const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           { 
             role: "system", 
-            content: "Extract the property address and contact phone number. Return ONLY JSON: { \"address\": \"string\", \"phone\": \"string\" }." 
+            content: `You are a property intake assistant. Extract the following from the conversation:
+            - address: Property location
+            - landlord_name: Full name of owner
+            - agency_name: Business/Agency name
+            - nin: 11-digit National ID (Personal)
+            - cac: Corporate Affairs Commission number (Business)
+            - preferences: { "max_occupants": number, "employment": "string", "pets": "string", "marital_status": "string" }
+
+            If info is missing, ask for ONE item politely (e.g., 'Could you please provide your NIN or CAC number for verification?').
+            RETURN ONLY JSON: { "address", "landlord_name", "agency_name", "nin", "cac", "preferences", "reply" }` 
           },
           { role: "user", content: Body }
         ],
@@ -94,7 +104,6 @@ export default async function handler(req, res) {
       tx.run(query, {
         sender: From,
         address: finalAddress,
-        phone: aiExtracted.phone || From,
         text: Body,
         imageLink: MediaUrl0 || null,
         msgId: MessageSid
@@ -102,7 +111,6 @@ export default async function handler(req, res) {
     );
 
     // --- MIRROR TO SUPABASE INSPECTIONS TABLE ---
-    // Clean the number by removing 'whatsapp:' prefix
     const cleanLandlordPhone = (From || "").replace('whatsapp:', '');
 
     const { error: supabaseError } = await supabase
@@ -110,8 +118,12 @@ export default async function handler(req, res) {
     .insert([
       { 
         address: finalAddress,
-        landlord_phone: cleanLandlordPhone, // Captured from the sender's number
-        landlord_name: userRole,            // Uses 'Landlord' or 'Property Manager' as name
+        landlord_phone: cleanLandlordPhone,
+        landlord_name: aiExtracted.landlord_name || userRole,
+        agency_name: aiExtracted.agency_name,
+        nin_number: aiExtracted.nin,
+        cac_number: aiExtracted.cac,
+        landlord_preferences: aiExtracted.preferences,
         status: 'assigned', 
         user_id: null       
       }
@@ -120,9 +132,9 @@ export default async function handler(req, res) {
     if (supabaseError) console.error("Supabase Save Error:", supabaseError);
     // -------------------------------
 
-    const responseMsg = aiExtracted.address 
-      ? `Received! We've logged the vacancy at ${aiExtracted.address}. A field agent will contact you shortly for inspection and to verify bank details.`
-      : "Thanks! We've received your message. Please ensure you've sent the full address so our field agent can schedule an inspection.";
+    const responseMsg = aiExtracted.reply || (aiExtracted.address 
+      ? `Received! We've logged the vacancy at ${aiExtracted.address}. A field agent will contact you shortly for inspection.`
+      : "Thanks! We've received your message. Please ensure you've sent the full address so our field agent can schedule an inspection.");
 
     return sendTwiML(res, responseMsg);
 
