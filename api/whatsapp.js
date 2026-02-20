@@ -1,6 +1,6 @@
 import neo4j from 'neo4j-driver';
 import OpenAI from 'openai';
-import { createClient } from '@supabase/supabase-js'; // Added Supabase import
+import { createClient } from '@supabase/supabase-js'; 
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const driver = neo4j.driver(
@@ -102,13 +102,18 @@ export default async function handler(req, res) {
     );
 
     // --- MIRROR TO SUPABASE INSPECTIONS TABLE ---
+    // Clean the number by removing 'whatsapp:' prefix
+    const cleanLandlordPhone = (From || "").replace('whatsapp:', '');
+
     const { error: supabaseError } = await supabase
     .from('inspections')
     .insert([
       { 
         address: finalAddress,
-        status: 'assigned', // Keep this as 'assigned' so it shows in your current app tab
-        user_id: null       // LEAVE THIS NULL. It goes into the "Pool."
+        landlord_phone: cleanLandlordPhone, // Captured from the sender's number
+        landlord_name: userRole,            // Uses 'Landlord' or 'Property Manager' as name
+        status: 'assigned', 
+        user_id: null       
       }
     ]);
 
