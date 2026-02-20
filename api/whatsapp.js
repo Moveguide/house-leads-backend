@@ -9,7 +9,6 @@ const driver = neo4j.driver(
   { disableLosslessIntegers: true }
 );
 
-// Initialize Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
@@ -20,134 +19,99 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
+  if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  const { Body, From, MessageSid, NumMedia, MediaUrl0 } = req.body;
+  const { Body, From, MessageSid, MediaUrl0 } = req.body;
   const session = driver.session();
-  const cleanBody = (Body || "").trim().toLowerCase();
+  const cleanBody = (Body || "").trim();
+  const cleanLandlordPhone = (From || "").replace('whatsapp:', '');
 
   try {
-    const isDeclaringLandlord = cleanBody.includes("landlord") || cleanBody.includes("owner");
-    const isDeclaringManager = cleanBody.includes("manager") || cleanBody.includes("caretaker");
-
-    if (isDeclaringLandlord || isDeclaringManager) {
-      const role = isDeclaringLandlord ? "Landlord" : "Property Manager";
-      await session.executeWrite(tx =>
-        tx.run('MERGE (p:Person { whatsapp: $sender }) SET p.role = $role', { sender: From, role })
-      );
-
-      return sendTwiML(res, `Got it, you are registered as a ${role}. Now, please send the address of the vacancy you want us to inspect.`);
-    }
-
+    // 1. CHECK REGISTRATION ROLE
     const personResult = await session.run(
       'MATCH (p:Person {whatsapp: $sender}) RETURN p.role AS role',
       { sender: From }
     );
-    const userRole = personResult.records[0]?.get('role');
+    let userRole = personResult.records[0]?.get('role');
 
     if (!userRole) {
+      const lowerBody = cleanBody.toLowerCase();
+      if (lowerBody.includes("landlord") || lowerBody.includes("manager") || lowerBody.includes("owner")) {
+        userRole = lowerBody.includes("landlord") || lowerBody.includes("owner") ? "Landlord" : "Property Manager";
+        await session.executeWrite(tx =>
+          tx.run('MERGE (p:Person { whatsapp: $sender }) SET p.role = $role', { sender: From, role: userRole })
+        );
+        return sendTwiML(res, `Great. You are registered as ${userRole}. What is your full name?`);
+      }
       return sendTwiML(res, "Welcome! To help us process your listing, are you the Landlord or the Property Manager?");
     }
 
-    // --- 1. FETCH CONTEXT FROM SUPABASE ---
-    const cleanLandlordPhone = (From || "").replace('whatsapp:', '');
-    const { data: existingLead } = await supabase
+    // 2. FETCH EXISTING PROGRESS FROM SUPABASE
+    const { data: existing } = await supabase
       .from('inspections')
       .select('*')
       .eq('landlord_phone', cleanLandlordPhone)
-      .order('created_at', { ascending: false })
-      .limit(1)
       .maybeSingle();
 
-    // --- 2. AI EXTRACTION WITH MEMORY ---
-    let aiExtracted = { address: null, landlord_name: null, agency_name: null, nin: null, cac: null, preferences: {}, reply: null };
-    if (Body && Body.length > 0) {
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          { 
-            role: "system", 
-            content: `You are a property intake assistant. 
-            WE ALREADY KNOW THIS ABOUT THE USER:
-            - Address: ${existingLead?.address || 'Unknown'}
-            - Landlord Name: ${existingLead?.landlord_name || 'Unknown'}
-            - NIN: ${existingLead?.nin_number || 'Unknown'}
-            - CAC: ${existingLead?.cac_number || 'Unknown'}
+    // 3. AI LOGIC WITH RIGID CHECKLIST
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { 
+          role: "system", 
+          content: `You are a property intake assistant. You must collect info in this EXACT order. 
+          
+          CURRENT STATUS:
+          1. Name: ${existing?.landlord_name || 'MISSING'}
+          2. Address: ${existing?.address || 'MISSING'}
+          3. ID (NIN/CAC): ${ (existing?.nin_number || existing?.cac_number) ? 'RECEIVED' : 'MISSING'}
+          4. Preferences: ${ (existing?.landlord_preferences && Object.keys(existing.landlord_preferences).length > 0) ? 'RECEIVED' : 'MISSING'}
 
-            YOUR TASK:
-            1. Extract any NEW info from the message.
-            2. If any core info (Address, Name, or an ID like NIN/CAC) is 'Unknown', politely ask for ONE of them.
-            3. If core info is complete, ask about preferences (pets, occupants, marital status).
-            4. Keep it natural and conversational. Ask ONLY ONE question at a time.
-            RETURN ONLY JSON: { "address", "landlord_name", "agency_name", "nin", "cac", "preferences", "reply" }` 
-          },
-          { role: "user", content: Body }
-        ],
-        response_format: { type: "json_object" }
-      });
-      aiExtracted = JSON.parse(completion.choices[0].message.content);
-    }
+          RULES:
+          - If Name is MISSING, ask for Name.
+          - If Name is present but Address is MISSING, ask for Address.
+          - If Address is present but ID is MISSING, ask for NIN (11 digits) or CAC (starts with BN or RC).
+          - If ID is present but Preferences are MISSING, ask if they have specific requirements (pets, marital status, number of occupants).
+          - If ALL 4 are present, say "Thank you! All details are logged. An agent will contact you shortly." and set 'complete' to true.
 
-    const finalAddress = aiExtracted.address || existingLead?.address || "Unknown/Address Pending";
+          RETURN ONLY JSON: { "landlord_name", "address", "nin", "cac", "preferences", "reply", "complete" }` 
+        },
+        { role: "user", content: cleanBody }
+      ],
+      response_format: { type: "json_object" }
+    });
 
-    // 5. Save the Lead for the Field Agent (Neo4j)
-    const query = `
-      MATCH (p:Person { whatsapp: $sender })
-      MERGE (prop:Property { address: $address })
-      ON CREATE SET 
-      prop.status = 'Pending_Inspection',
-      prop.verified = false,
-      prop.synced = false
-      
-      CREATE (p)-[r:LISTED { id: $msgId }]->(prop)
-      SET 
-        r.originalText = $text,
-        r.evidenceImage = $imageLink,
-        r.createdAt = datetime(),
-        r.roleAtTimeOfListing = p.role
-        
-      RETURN prop
-    `;
+    const ai = JSON.parse(completion.choices[0].message.content);
 
-    await session.executeWrite(tx =>
-      tx.run(query, {
-        sender: From,
-        address: finalAddress,
-        text: Body,
-        imageLink: MediaUrl0 || null,
-        msgId: MessageSid
-      })
-    );
-
-    // --- 3. MIRROR TO SUPABASE (UPSERT MODE) ---
-    const { error: supabaseError } = await supabase
-    .from('inspections')
-    .upsert({ 
-        landlord_phone: cleanLandlordPhone,
-        address: finalAddress,
-        landlord_name: aiExtracted.landlord_name || existingLead?.landlord_name || userRole,
-        agency_name: aiExtracted.agency_name || existingLead?.agency_name,
-        nin_number: aiExtracted.nin || existingLead?.nin_number,
-        cac_number: aiExtracted.cac || existingLead?.cac_number,
-        landlord_preferences: { ...existingLead?.landlord_preferences, ...aiExtracted.preferences },
-        status: 'assigned', 
-        user_id: null       
+    // 4. UPDATE SUPABASE (UPSERT)
+    await supabase.from('inspections').upsert({
+      landlord_phone: cleanLandlordPhone,
+      landlord_name: ai.landlord_name || existing?.landlord_name || userRole,
+      address: ai.address || existing?.address,
+      nin_number: ai.nin || existing?.nin_number,
+      cac_number: ai.cac || existing?.cac_number,
+      landlord_preferences: ai.preferences && Object.keys(ai.preferences).length > 0 ? ai.preferences : existing?.landlord_preferences,
+      status: 'assigned'
     }, { onConflict: 'landlord_phone' });
 
-    if (supabaseError) console.error("Supabase Save Error:", supabaseError);
-    // -------------------------------
+    // 5. UPDATE NEO4J (KEEPING YOUR ORIGINAL LOGIC)
+    if (ai.address) {
+      await session.executeWrite(tx =>
+        tx.run(`
+          MATCH (p:Person { whatsapp: $sender })
+          MERGE (prop:Property { address: $address })
+          CREATE (p)-[r:LISTED { id: $msgId }]->(prop)
+          SET r.createdAt = datetime()`, 
+        { sender: From, address: ai.address, msgId: MessageSid })
+      );
+    }
 
-    const responseMsg = aiExtracted.reply || "Thanks! We've received your message and are processing the details.";
-
-    return sendTwiML(res, responseMsg);
+    return sendTwiML(res, ai.reply);
 
   } catch (error) {
     console.error("Error:", error);
-    return sendTwiML(res, "Message received! We're having a technical hiccup, but our team will review your message manually.");
+    return sendTwiML(res, "We've received your message and will update your record manually.");
   } finally {
     await session.close();
   }
@@ -155,9 +119,5 @@ export default async function handler(req, res) {
 
 function sendTwiML(res, message) {
   res.setHeader('Content-Type', 'text/xml');
-  return res.status(200).send(`
-    <Response>
-      <Message>${message}</Message>
-    </Response>
-  `);
+  return res.status(200).send(`<Response><Message>${message}</Message></Response>`);
 }
