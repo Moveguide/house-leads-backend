@@ -8,41 +8,37 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
-  const { Body, From } = req.body;
+  const { Body, From, MessageSid } = req.body;
   const cleanBody = (Body || "").trim();
-  const senderPhone = (From || "").replace('whatsapp:', '');
+  const sender = (From || "").replace('whatsapp:', '');
+  const session = driver.session();
 
   try {
-    // 1. FETCH ALL DATA FOR THIS PHONE
-    const { data: records } = await supabase
-      .from('inspections')
-      .select('*')
-      .eq('landlord_phone', senderPhone);
-    
-    // Find the current state of this user
-    const knownName = records?.find(r => r.landlord_name && r.landlord_name !== "COMPLETED")?.landlord_name;
-    const knownIDRecord = records?.find(r => r.nin_number || r.cac_number);
-    const latestListing = records?.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0] || {};
+    // 1. Fetch current progress
+    const { data: existing } = await supabase.from('inspections').select('*').eq('landlord_phone', sender).maybeSingle();
 
-    // 2. LOGIC: Determine exactly what we are looking for
-    let currentGoal = "NAME";
-    if (knownName) currentGoal = "ADDRESS";
-    if (knownName && latestListing.address && latestListing.address !== "Pending") currentGoal = "ID";
-    if (knownName && latestListing.address && (knownIDRecord?.nin_number || knownIDRecord?.cac_number)) currentGoal = "PREFERENCES";
-
-    // 3. AI: Only extract the specific goal
+    // 2. The Interviewer Logic
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         { 
           role: "system", 
-          content: `You are an extractor. The user is trying to provide their ${currentGoal}.
-          - Extract the value. 
-          - If the user is giving an ADDRESS, extract the full location.
-          - If the user is giving an ID, check if it's an 11-digit NIN or a CAC (starts with BN or RC).
-          - Write a short, friendly reply asking for the NEXT step in this sequence: Name -> Address -> NIN/CAC -> Preferences.
+          content: `You are a strict data collection bot. Check the database values and ask for the NEXT missing item.
           
-          RETURN ONLY JSON: { "extracted_value": "string", "reply": "string" }` 
+          DATABASE VALUES:
+          - Name: ${existing?.landlord_name || 'NULL'}
+          - Address: ${existing?.address || 'NULL'}
+          - NIN/CAC: ${existing?.nin_number || existing?.cac_number || 'NULL'}
+          - Preferences: ${existing?.landlord_preferences ? 'SAVED' : 'NULL'}
+
+          LOGIC RULES:
+          1. If Name is NULL, extract name from user and ask for Address.
+          2. If Name exists but Address is NULL, extract address and ask for NIN (11 digits) or CAC (starts with BN or RC).
+          3. If Address exists but NIN/CAC is NULL, extract ID and ask for preferential requirements (pets, family, etc).
+          4. If NIN/CAC exists, extract preferences and say "All set! An agent will call you."
+          
+          OUTPUT ONLY JSON: 
+          { "landlord_name": "string", "address": "string", "nin": "string", "cac": "string", "preferences": {}, "reply": "string" }` 
         },
         { role: "user", content: cleanBody }
       ],
@@ -50,27 +46,31 @@ export default async function handler(req, res) {
     });
 
     const ai = JSON.parse(completion.choices[0].message.content);
-    const newVal = ai.extracted_value;
 
-    // 4. MAP EXTRACTED DATA TO CORRECT COLUMNS
+    // 3. Prevent overwriting existing data with NULLs (The Loop Buster)
     const updateData = {
-      landlord_phone: senderPhone,
-      landlord_name: currentGoal === "NAME" ? newVal : (knownName || "Unknown"),
-      address: currentGoal === "ADDRESS" ? newVal : (latestListing.address || "Pending"),
-      nin_number: (currentGoal === "ID" && newVal?.length === 11) ? newVal : (knownIDRecord?.nin_number || null),
-      cac_number: (currentGoal === "ID" && (newVal?.startsWith('BN') || newVal?.startsWith('RC'))) ? newVal : (knownIDRecord?.cac_number || null),
-      landlord_preferences: currentGoal === "PREFERENCES" ? newVal : (latestListing.landlord_preferences || {}),
+      landlord_phone: sender,
+      landlord_name: ai.landlord_name || existing?.landlord_name,
+      address: ai.address || existing?.address,
+      nin_number: ai.nin || existing?.nin_number,
+      cac_number: ai.cac || existing?.cac_number,
+      landlord_preferences: (ai.preferences && Object.keys(ai.preferences).length > 0) ? ai.preferences : existing?.landlord_preferences,
       status: 'assigned'
     };
 
-    // 5. UPSERT TO SUPABASE
-    await supabase.from('inspections').upsert(updateData, { onConflict: 'landlord_phone, address' });
+    // 4. Update Supabase
+    await supabase.from('inspections').upsert(updateData, { onConflict: 'landlord_phone' });
+
+    // 5. Update Neo4j if Address is newly found
+    if (ai.address || existing?.address) {
+      await session.executeWrite(tx => tx.run('MERGE (p:Person {whatsapp: $f}) MERGE (pr:Property {address: $a}) MERGE (p)-[:LISTED]->(pr)', { f: From, a: ai.address || existing.address }));
+    }
 
     return sendTwiML(res, ai.reply);
-
   } catch (e) {
-    console.error(e);
-    return sendTwiML(res, "Thanks! What is the next detail (Name, Address, or ID)?");
+    return sendTwiML(res, "Got it. Please continue.");
+  } finally {
+    await session.close();
   }
 }
 
