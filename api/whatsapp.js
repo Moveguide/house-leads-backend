@@ -8,37 +8,45 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
-  const { Body, From, MessageSid } = req.body;
+  const { Body, From } = req.body;
   const cleanBody = (Body || "").trim();
-  const sender = (From || "").replace('whatsapp:', '');
-  const session = driver.session();
+  const senderPhone = (From || "").replace('whatsapp:', '');
 
   try {
-    // 1. Fetch current progress
-    const { data: existing } = await supabase.from('inspections').select('*').eq('landlord_phone', sender).maybeSingle();
+    // 1. FETCH DATA - Use .eq() correctly
+    const { data: existing } = await supabase
+      .from('inspections')
+      .select('*')
+      .eq('landlord_phone', senderPhone)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    // 2. The Interviewer Logic
+    // 2. DETERMINE THE CURRENT STEP (Force the AI to see the checklist)
+    const nameStatus = existing?.landlord_name ? "COMPLETED" : "MISSING";
+    const addressStatus = existing?.address && existing.address !== "Pending" ? "COMPLETED" : "MISSING";
+    const idStatus = (existing?.nin_number || existing?.cac_number) ? "COMPLETED" : "MISSING";
+    const prefStatus = (existing?.landlord_preferences && Object.keys(existing.landlord_preferences).length > 0) ? "COMPLETED" : "MISSING";
+
+    // 3. AI INTERVIEWER
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         { 
           role: "system", 
-          content: `You are a strict data collection bot. Check the database values and ask for the NEXT missing item.
-          
-          DATABASE VALUES:
-          - Name: ${existing?.landlord_name || 'NULL'}
-          - Address: ${existing?.address || 'NULL'}
-          - NIN/CAC: ${existing?.nin_number || existing?.cac_number || 'NULL'}
-          - Preferences: ${existing?.landlord_preferences ? 'SAVED' : 'NULL'}
+          content: `You are a real estate assistant. Follow this checklist STRICTLY:
+          1. NAME: ${nameStatus} (Value: ${existing?.landlord_name || 'None'})
+          2. ADDRESS: ${addressStatus} (Value: ${existing?.address || 'None'})
+          3. ID (NIN/CAC): ${idStatus}
+          4. PREFERENCES: ${prefStatus}
 
-          LOGIC RULES:
-          1. If Name is NULL, extract name from user and ask for Address.
-          2. If Name exists but Address is NULL, extract address and ask for NIN (11 digits) or CAC (starts with BN or RC).
-          3. If Address exists but NIN/CAC is NULL, extract ID and ask for preferential requirements (pets, family, etc).
-          4. If NIN/CAC exists, extract preferences and say "All set! An agent will call you."
+          DIRECTIONS:
+          - If a step is MISSING, extract that info from the user's message.
+          - If the user provides info for a MISSING step, move to the NEXT missing step in your 'reply'.
+          - NEVER ask for info that is already COMPLETED.
+          - NIN must be 11 digits. CAC must start with BN or RC.
           
-          OUTPUT ONLY JSON: 
-          { "landlord_name": "string", "address": "string", "nin": "string", "cac": "string", "preferences": {}, "reply": "string" }` 
+          RETURN ONLY JSON: { "landlord_name", "address", "nin", "cac", "preferences", "reply" }` 
         },
         { role: "user", content: cleanBody }
       ],
@@ -47,30 +55,25 @@ export default async function handler(req, res) {
 
     const ai = JSON.parse(completion.choices[0].message.content);
 
-    // 3. Prevent overwriting existing data with NULLs (The Loop Buster)
+    // 4. SMART MERGE (This prevents the loop by keeping existing data if AI misses it)
     const updateData = {
-      landlord_phone: sender,
+      landlord_phone: senderPhone,
       landlord_name: ai.landlord_name || existing?.landlord_name,
-      address: ai.address || existing?.address,
+      address: ai.address || existing?.address || "Pending",
       nin_number: ai.nin || existing?.nin_number,
       cac_number: ai.cac || existing?.cac_number,
       landlord_preferences: (ai.preferences && Object.keys(ai.preferences).length > 0) ? ai.preferences : existing?.landlord_preferences,
       status: 'assigned'
     };
 
-    // 4. Update Supabase
-    await supabase.from('inspections').upsert(updateData, { onConflict: 'landlord_phone' });
-
-    // 5. Update Neo4j if Address is newly found
-    if (ai.address || existing?.address) {
-      await session.executeWrite(tx => tx.run('MERGE (p:Person {whatsapp: $f}) MERGE (pr:Property {address: $a}) MERGE (p)-[:LISTED]->(pr)', { f: From, a: ai.address || existing.address }));
-    }
+    // 5. UPSERT
+    await supabase.from('inspections').upsert(updateData, { onConflict: 'landlord_phone, address' });
 
     return sendTwiML(res, ai.reply);
+
   } catch (e) {
-    return sendTwiML(res, "Got it. Please continue.");
-  } finally {
-    await session.close();
+    console.error(e);
+    return sendTwiML(res, "Got that. Please provide the next detail (Name, Address, ID, or Preferences).");
   }
 }
 
