@@ -1,136 +1,198 @@
 import { createClient } from '@supabase/supabase-js';
+import { sendTwiML } from './twiml-utils.js'; // helper function you already have
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-
-// Map steps
-const STEPS = ["NAME", "NIN_CAC", "ADDRESS", "PREFERENCES", "DONE"];
+// ---------------------------
+// Supabase client using SERVICE_ROLE key
+// ---------------------------
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
+
   const { Body, From } = req.body;
-  const text = (Body || "").trim();
-  const phone = (From || "").replace("whatsapp:", "");
+  const msg = (Body || "").trim();
+  const phone = (From || "").replace('whatsapp:', '');
 
   try {
-    // 1️⃣ Check if landlord exists
+    // ---------------------------
+    // 1. Check if landlord exists
+    // ---------------------------
     let { data: landlord } = await supabase
       .from('landlords')
       .select('*')
       .eq('phone', phone)
       .maybeSingle();
 
-    // 1a. If message is "Start" or "New Property", create landlord if missing
-    if (text.toLowerCase() === "start" || text.toLowerCase() === "new property") {
+    // ---------------------------
+    // 2. Welcome message / Start
+    // ---------------------------
+    if (!landlord || msg.toLowerCase() === "start") {
       if (!landlord) {
-        const { data: newLandlord } = await supabase
+        const { data: newLandlord, error } = await supabase
           .from('landlords')
-          .insert({ phone, created_at: new Date().toISOString(), name: null, preferences: {} })
+          .insert({
+            phone,
+            name: null,
+            preferences: {},
+            nin_number: null,
+            cac_number: null
+          })
           .select()
-          .maybeSingle();
+          .single();
+
+        if (error) {
+          console.error("Landlord insert error:", error);
+          return sendTwiML(res, "System error. Please try again later.");
+        }
         landlord = newLandlord;
       }
 
-      // Reset step
-      await supabase
+      return sendTwiML(
+        res,
+        `Welcome! To register a new property, type "New Property". We'll guide you step by step.`
+      );
+    }
+
+    // ---------------------------
+    // 3. Handle new property flow
+    // ---------------------------
+    if (msg.toLowerCase() === "new property") {
+      const { data: property, error } = await supabase
+        .from('properties')
+        .insert({
+          landlord_id: landlord.id,
+          address: null,
+          status: 'active'
+        })
+        .select()
+        .single();
+
+      if (error) {
+        console.error("Property insert error:", error);
+        return sendTwiML(res, "Could not create property. Try again later.");
+      }
+
+      return sendTwiML(
+        res,
+        `Great! Let's register this property. Please send the full address of the property.`
+      );
+    }
+
+    // ---------------------------
+    // 4. Find the last active property for this landlord
+    // ---------------------------
+    const { data: activeProperty } = await supabase
+      .from('properties')
+      .select('*')
+      .eq('landlord_id', landlord.id)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!activeProperty) {
+      return sendTwiML(
+        res,
+        `Please start by typing "New Property" to register your first property.`
+      );
+    }
+
+    // ---------------------------
+    // 5. Update property with address
+    // ---------------------------
+    if (!activeProperty.address) {
+      const { error } = await supabase
+        .from('properties')
+        .update({ address: msg })
+        .eq('id', activeProperty.id);
+
+      if (error) {
+        console.error("Property update error:", error);
+        return sendTwiML(res, "Could not save address. Try again.");
+      }
+
+      return sendTwiML(
+        res,
+        `Address saved! Next, please send your NIN (11 digits) or CAC (starts with BN/RC).`
+      );
+    }
+
+    // ---------------------------
+    // 6. Save NIN or CAC
+    // ---------------------------
+    if (!landlord.nin_number && /^\d{11}$/.test(msg)) {
+      const { error } = await supabase
         .from('landlords')
-        .update({ current_step: "NAME" })
+        .update({ nin_number: msg })
         .eq('id', landlord.id);
 
-      return sendTwiML(res, `Hi! Let’s register a property. Please send the landlord’s full name.`);
+      if (error) {
+        console.error("NIN update error:", error);
+        return sendTwiML(res, "Could not save NIN. Try again.");
+      }
+
+      return sendTwiML(
+        res,
+        `NIN saved! Now you can send any preferences for this property, e.g., rent, amenities, etc. Or type "All Done" if finished.`
+      );
     }
 
-    if (!landlord) {
-      // If landlord not found and not a "Start" message
-      return sendTwiML(res, `Please send "Start" or "New Property" to begin registering your property.`);
+    if (!landlord.cac_number && /^(BN|RC)/i.test(msg)) {
+      const { error } = await supabase
+        .from('landlords')
+        .update({ cac_number: msg })
+        .eq('id', landlord.id);
+
+      if (error) {
+        console.error("CAC update error:", error);
+        return sendTwiML(res, "Could not save CAC. Try again.");
+      }
+
+      return sendTwiML(
+        res,
+        `CAC saved! Now you can send any preferences for this property, e.g., rent, amenities, etc. Or type "All Done" if finished.`
+      );
     }
 
-    // 2️⃣ Determine current step
-    let currentStep = landlord.current_step || "NAME";
-    let reply = "";
+    // ---------------------------
+    // 7. Save preferences
+    // ---------------------------
+    if (msg.toLowerCase() !== "all done") {
+      const preferences = { notes: msg };
+      const { error } = await supabase
+        .from('properties')
+        .update({ notes: msg })
+        .eq('id', activeProperty.id);
 
-    // 3️⃣ Handle each step
-    switch (currentStep) {
-      case "NAME":
-        // Save landlord name
-        await supabase
-          .from('landlords')
-          .update({ name: text, current_step: "NIN_CAC" })
-          .eq('id', landlord.id);
+      if (error) {
+        console.error("Preferences update error:", error);
+        return sendTwiML(res, "Could not save preferences. Try again.");
+      }
 
-        reply = `Thanks, ${text}! Please provide your NIN (11 digits) or CAC (starts with BN or RC).`;
-        break;
-
-      case "NIN_CAC":
-        let nin = null;
-        let cac = null;
-
-        if (/^\d{11}$/.test(text)) nin = text;
-        else if (/^(BN|RC)/i.test(text)) cac = text;
-
-        if (!nin && !cac) {
-          reply = `That doesn’t look like a valid NIN or CAC. Please send a valid NIN or CAC.`;
-          break;
-        }
-
-        await supabase
-          .from('landlords')
-          .update({ nin_number: nin, cac_number: cac, current_step: "ADDRESS" })
-          .eq('id', landlord.id);
-
-        reply = `Got it! Now, please send the property address.`;
-        break;
-
-      case "ADDRESS":
-        // Create a property
-        const { data: newProperty } = await supabase
-          .from('properties')
-          .insert({
-            landlord_id: landlord.id,
-            address: text,
-            status: 'active',
-            created_at: new Date().toISOString()
-          })
-          .select()
-          .maybeSingle();
-
-        // Save property ID in landlord session (optional)
-        await supabase
-          .from('landlords')
-          .update({ current_step: "PREFERENCES" })
-          .eq('id', landlord.id);
-
-        reply = `Property registered at "${text}". Any preferences for this property? If none, reply "No".`;
-        break;
-
-      case "PREFERENCES":
-        // Save preferences as JSON
-        let prefs = text.toLowerCase() === "no" ? {} : { notes: text };
-
-        await supabase
-          .from('landlords')
-          .update({ preferences: prefs, current_step: "DONE" })
-          .eq('id', landlord.id);
-
-        reply = `All done for this property! You can send "New Property" to register another.`;
-        break;
-
-      case "DONE":
-        reply = `You have completed a property registration. Send "New Property" to register another.`;
-        break;
-
-      default:
-        reply = `Oops! Something went wrong. Send "Start" to begin registering a property.`;
+      return sendTwiML(
+        res,
+        `Preferences saved! Type "All Done" if finished with this property.`
+      );
     }
 
-    return sendTwiML(res, reply);
+    // ---------------------------
+    // 8. Mark property complete
+    // ---------------------------
+    await supabase
+      .from('properties')
+      .update({ status: 'completed' })
+      .eq('id', activeProperty.id);
 
-  } catch (e) {
-    console.error(e);
+    return sendTwiML(
+      res,
+      `All done for this property! You can type "New Property" to register another property.`
+    );
+
+  } catch (err) {
+    console.error("WhatsApp handler error:", err);
     return sendTwiML(res, `Something went wrong. Please send "Start" to try again.`);
   }
-}
-
-function sendTwiML(res, msg) {
-  res.setHeader('Content-Type', 'text/xml');
-  return res.status(200).send(`<Response><Message>${msg}</Message></Response>`);
 }
