@@ -1,5 +1,4 @@
 import { createClient } from '@supabase/supabase-js';
-import { sendTwiML } from './twiml-utils.js'; // helper function you already have
 
 // ---------------------------
 // Supabase client using SERVICE_ROLE key
@@ -9,6 +8,17 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// ---------------------------
+// Helper to send Twilio-compatible XML response
+// ---------------------------
+function sendTwiML(res, msg) {
+  res.setHeader('Content-Type', 'text/xml');
+  return res.status(200).send(`<Response><Message>${msg}</Message></Response>`);
+}
+
+// ---------------------------
+// WhatsApp Handler
+// ---------------------------
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
@@ -17,18 +27,14 @@ export default async function handler(req, res) {
   const phone = (From || "").replace('whatsapp:', '');
 
   try {
-    // ---------------------------
     // 1. Check if landlord exists
-    // ---------------------------
     let { data: landlord } = await supabase
       .from('landlords')
       .select('*')
       .eq('phone', phone)
       .maybeSingle();
 
-    // ---------------------------
     // 2. Welcome message / Start
-    // ---------------------------
     if (!landlord || msg.toLowerCase() === "start") {
       if (!landlord) {
         const { data: newLandlord, error } = await supabase
@@ -56,9 +62,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------------------------
     // 3. Handle new property flow
-    // ---------------------------
     if (msg.toLowerCase() === "new property") {
       const { data: property, error } = await supabase
         .from('properties')
@@ -81,9 +85,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------------------------
     // 4. Find the last active property for this landlord
-    // ---------------------------
     const { data: activeProperty } = await supabase
       .from('properties')
       .select('*')
@@ -100,9 +102,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------------------------
     // 5. Update property with address
-    // ---------------------------
     if (!activeProperty.address) {
       const { error } = await supabase
         .from('properties')
@@ -120,9 +120,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------------------------
     // 6. Save NIN or CAC
-    // ---------------------------
     if (!landlord.nin_number && /^\d{11}$/.test(msg)) {
       const { error } = await supabase
         .from('landlords')
@@ -157,11 +155,8 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------------------------
     // 7. Save preferences
-    // ---------------------------
     if (msg.toLowerCase() !== "all done") {
-      const preferences = { notes: msg };
       const { error } = await supabase
         .from('properties')
         .update({ notes: msg })
@@ -178,9 +173,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------------------------
     // 8. Mark property complete
-    // ---------------------------
     await supabase
       .from('properties')
       .update({ status: 'completed' })
