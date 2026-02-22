@@ -77,13 +77,32 @@ export default async function handler(req, res) {
       return sendTwiML(res, "Address saved! Any tenant preferences (e.g., 'no pets')? Reply 'No' if none.");
     }
 
-    if (step === "PREFERENCES") {
+        if (step === "PREFERENCES") {
       const prefs = text.toLowerCase() === "no" ? { note: "None" } : { note: text };
       
-      await supabase.from('properties').update({ landlord_preferences: prefs }).eq('id', landlord.last_property_id);
-      await supabase.from('landlords').update({ current_step: "DONE" }).eq('landlord_phone', phone);
+      // 1. Update the property with preferences
+      await supabase
+        .from('properties')
+        .update({ landlord_preferences: prefs })
+        .eq('id', landlord.last_property_id);
+      
+      // 2. THIS IS THE NEW PART: Create the "Ticket" in the inspections table
+      const { error: inspectErr } = await supabase
+        .from('inspections')
+        .insert({
+          property_id: landlord.last_property_id,
+          status: 'pending' // This makes it show up on your "To-be-assigned" list
+        });
 
-      return sendTwiML(res, "All done! We will notify you when an agent is assigned. Type 'New Property' to add another.");
+      if (inspectErr) throw new Error(`Inspection Ticket Fail: ${inspectErr.message}`);
+
+      // 3. Mark the landlord session as DONE
+      await supabase
+        .from('landlords')
+        .update({ current_step: "DONE" })
+        .eq('landlord_phone', phone);
+
+      return sendTwiML(res, "Fantastic! Everything is saved. Your property is now queued for inspection. We'll be in touch soon!");
     }
 
     return sendTwiML(res, "Registration complete! Type 'New Property' to add another.");
