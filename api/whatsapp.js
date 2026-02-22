@@ -10,16 +10,17 @@ export default async function handler(req, res) {
   const phone = (From || "").replace('whatsapp:', '');
 
   try {
-    // 1. Get latest inspection row for this landlord
+    // 1. Get the latest property (row) that is not DONE
     let { data: row } = await supabase
       .from('inspections')
       .select('*')
       .eq('landlord_phone', phone)
+      .neq('current_step', 'DONE')
       .order('created_at', { ascending: false })
       .limit(1)
       .single();
 
-    // 2. If no row exists, create it
+    // 2. If no active row exists, create a new one
     if (!row) {
       const { data } = await supabase
         .from('inspections')
@@ -29,7 +30,7 @@ export default async function handler(req, res) {
       row = data;
     }
 
-    // 3. Determine next step based on current_step
+    // 3. Determine the next step based on current_step
     let reply = '';
     let update = {};
 
@@ -40,8 +41,27 @@ export default async function handler(req, res) {
         break;
 
       case 'ADDRESS':
-        update = { address: message, current_step: 'ID' };
-        reply = 'Got it! Please provide your NIN (11-digit) or CAC (starts with BN or RC).';
+        // If this address already exists in the table, create a new row instead
+        const { data: existing } = await supabase
+          .from('inspections')
+          .select('*')
+          .eq('landlord_phone', phone)
+          .eq('address', message)
+          .limit(1);
+
+        if (existing?.length > 0) {
+          // Duplicate address → start a new row
+          const { data: newRow } = await supabase
+            .from('inspections')
+            .insert({ landlord_phone: phone, current_step: 'ID', address: message })
+            .select()
+            .single();
+          row = newRow;
+          reply = 'Got it! Please provide your NIN (11-digit) or CAC (starts with BN or RC) for this property.';
+        } else {
+          update = { address: message, current_step: 'ID' };
+          reply = 'Got it! Please provide your NIN (11-digit) or CAC (starts with BN or RC).';
+        }
         break;
 
       case 'ID':
@@ -58,11 +78,11 @@ export default async function handler(req, res) {
 
       case 'PREFERENCES':
         update = { landlord_preferences: message, current_step: 'DONE' };
-        reply = 'All done! Thanks for providing your info.';
+        reply = 'All done for this property! You can send another address to register a new property.';
         break;
 
       case 'DONE':
-        reply = 'We already have all your info. Thank you!';
+        reply = 'We already have all info for this property. Send a new property address to add another.';
         break;
 
       default:
@@ -71,7 +91,7 @@ export default async function handler(req, res) {
         break;
     }
 
-    // 4. Update row in database
+    // 4. Update current row in database
     if (Object.keys(update).length) {
       await supabase
         .from('inspections')
