@@ -91,7 +91,7 @@ export default async function handler(req, res) {
         .from('inspections')
         .insert({
           property_id: landlord.last_property_id,
-          status: 'pending' // This makes it show up on your "To-be-assigned" list
+          status: 'assigned' // This makes it show up on your "To-be-assigned" list
         });
 
       if (inspectErr) throw new Error(`Inspection Ticket Fail: ${inspectErr.message}`);
