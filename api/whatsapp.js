@@ -19,7 +19,7 @@ export default async function handler(req, res) {
 
     if (fetchError) throw new Error(`Fetch Fail: ${fetchError.message}`);
 
-    const isReset = ["start", "reset", "new property"].includes(text.toLowerCase());
+    const isReset = ["start", "reset", "new move"].includes(text.toLowerCase());
 
     // --- SMART MEMORY CHECK ---
     if (!landlord || isReset) {
@@ -54,11 +54,11 @@ export default async function handler(req, res) {
       else return sendTwiML(res, "Invalid format. Send an 11-digit NIN or a CAC starting with BN/RC.");
 
       await supabase.from('landlords').update({ ...idData, current_step: "ID_UPLOAD" }).eq('landlord_phone', phone);
-      return sendTwiML(res, "Got it! Please upload a clear photo of your ID Card.");
+      return sendTwiML(res, "Got it! Please upload a clear photo of your NIN ID Card.");
     }
 
     if (step === "ID_UPLOAD") {
-      if (!MediaUrl0) return sendTwiML(res, "Please send a photo of your ID card to proceed.");
+      if (!MediaUrl0) return sendTwiML(res, "Please send a photo of your NIN ID card to proceed.");
       const fileUrl = await uploadToSupabase(MediaUrl0, `IDs/${phone}.jpg`);
       
       // AUTO-VERIFY: status changes here once file is received
@@ -93,7 +93,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, "Fantastic! Everything is saved. Your property is now queued for inspection.");
     }
 
-    return sendTwiML(res, "Registration complete! Type 'New Property' to add another.");
+    return sendTwiML(res, "Registration complete! Type 'New Move' to add another.");
 
   } catch (err) {
     return sendTwiML(res, `System Error: ${err.message}. Type 'Reset' to fix.`);
@@ -103,9 +103,9 @@ export default async function handler(req, res) {
 async function uploadToSupabase(url, fileName) {
   const response = await fetch(url);
   const blob = await response.buffer();
-  const { data, error } = await supabase.storage.from('landlord_documents').upload(fileName, blob, { contentType: 'image/jpeg', upsert: true });
+  const { data, error } = await supabase.storage.from('landlord-documents').upload(fileName, blob, { contentType: 'image/jpeg', upsert: true });
   if (error) throw new Error(`Storage Fail: ${error.message}`);
-  const { data: publicUrl } = supabase.storage.from('landlord_documents').getPublicUrl(fileName);
+  const { data: publicUrl } = supabase.storage.from('landlord-documents').getPublicUrl(fileName);
   return publicUrl.publicUrl;
 }
 
