@@ -90,10 +90,10 @@ export default async function handler(req, res) {
       
       await supabase.from('inspections').insert({ property_id: landlord.last_property_id, status: 'assigned' });
       await supabase.from('landlords').update({ current_step: "DONE" }).eq('landlord_phone', phone);
-      return sendTwiML(res, "Fantastic! Everything is saved. Your property is now queued for inspection.");
+      return sendTwiML(res, "Fantastic! Everything is saved. Your property is now queued for inspection in 24 hours.");
     }
 
-    return sendTwiML(res, "Registration complete! Type 'New Move' to add another.");
+    return sendTwiML(res, "Registration complete! Type 'New Move' to add another residence.");
 
   } catch (err) {
     return sendTwiML(res, `System Error: ${err.message}. Type 'Reset' to fix.`);
