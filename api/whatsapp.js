@@ -85,13 +85,60 @@ export default async function handler(req, res) {
     }
 
     if (step === "PREFERENCES") {
-      const prefs = text.toLowerCase() === "no" ? { note: "None" } : { note: text };
-      await supabase.from('properties').update({ landlord_preferences: prefs }).eq('id', landlord.last_property_id);
-      
-      await supabase.from('inspections').insert({ property_id: landlord.last_property_id, status: 'assigned' });
-      await supabase.from('landlords').update({ current_step: "DONE" }).eq('landlord_phone', phone);
-      return sendTwiML(res, "Fantastic! Everything is saved. Your property is now queued for inspection in 24 hours.");
+    const prefs = text.toLowerCase() === "no" ? { note: "None" } : { note: text };
+    await supabase.from('properties').update({ landlord_preferences: prefs }).eq('id', landlord.last_property_id);
+    await supabase.from('landlords').update({ current_step: "ACCOMMODATION_TYPE" }).eq('landlord_phone', phone);
+    return sendTwiML(res, `What type of accommodation is this property?\n\n1. Short Stay\n2. Tenancy\n3. Hotel\n4. Shared Apartment\n\nReply with the number.`);
+  }
+
+  if (step === "ACCOMMODATION_TYPE") {
+    const accommodationMap = {
+      "1": "Short Stay",
+      "2": "Tenancy", 
+      "3": "Hotel",
+      "4": "Shared Apartment",
+      "short stay": "Short Stay",
+      "tenancy": "Tenancy",
+      "hotel": "Hotel",
+      "shared apartment": "Shared Apartment",
+    };
+
+    const accommodationType = accommodationMap[text.toLowerCase()] || accommodationMap[text];
+    if (!accommodationType) {
+      return sendTwiML(res, `Please reply with a number:\n\n1. Short Stay\n2. Tenancy\n3. Hotel\n4. Shared Apartment`);
     }
+
+    await supabase.from('properties').update({ accommodation_type: accommodationType }).eq('id', landlord.last_property_id);
+    await supabase.from('landlords').update({ current_step: "CONTRACT_DURATION" }).eq('landlord_phone', phone);
+    return sendTwiML(res, `What is the minimum contract duration?\n\n1. Daily\n2. Monthly\n3. Quarterly\n4. Bi-annually\n5. Annually\n6. 2 Years+\n\nReply with the number.`);
+  }
+
+  if (step === "CONTRACT_DURATION") {
+    const durationMap = {
+      "1": "Daily",
+      "2": "Monthly",
+      "3": "Quarterly",
+      "4": "Bi-annually",
+      "5": "Annually",
+      "6": "2 Years+",
+      "daily": "Daily",
+      "monthly": "Monthly",
+      "quarterly": "Quarterly",
+      "bi-annually": "Bi-annually",
+      "annually": "Annually",
+      "2 years+": "2 Years+",
+    };
+
+    const contractDuration = durationMap[text.toLowerCase()] || durationMap[text];
+    if (!contractDuration) {
+      return sendTwiML(res, `Please reply with a number:\n\n1. Daily\n2. Monthly\n3. Quarterly\n4. Bi-annually\n5. Annually\n6. 2 Years+`);
+    }
+
+    await supabase.from('properties').update({ contract_duration: contractDuration }).eq('id', landlord.last_property_id);
+    await supabase.from('inspections').insert({ property_id: landlord.last_property_id, status: 'assigned' });
+    await supabase.from('landlords').update({ current_step: "DONE" }).eq('landlord_phone', phone);
+    return sendTwiML(res, "Fantastic! Everything is saved. Your property is now queued for inspection in 24 hours. 🎉");
+  }
 
     return sendTwiML(res, "Registration complete! Type 'New Move' to add another residence.");
 
