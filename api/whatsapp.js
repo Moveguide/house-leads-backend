@@ -11,6 +11,44 @@ export default async function handler(req, res) {
   const phone = (From || "").replace("whatsapp:", "").trim();
 
   try {
+
+    // Handle application approval/rejection
+const upperText = text.toUpperCase();
+if (upperText.startsWith('YES ') || upperText.startsWith('NO ')) {
+  const parts = upperText.split(/\s+/);
+  const decision = parts[0]; // YES or NO
+  const applicationId = parts[1]; // UUID
+
+  if (applicationId) {
+    try {
+        const response = await fetch('https://app.moveguide.co/api/webhook/whatsapp', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-webhook-secret': process.env.WHATSAPP_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify({
+            message: text,
+            from: phone,
+          }),
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+          const confirmMsg = data.status === 'approved'
+            ? '✅ Application approved! The tenant will be notified to make payment.'
+            : '❌ Application rejected. The tenant has been notified.';
+          return sendTwiML(res, confirmMsg);
+        } else {
+          return sendTwiML(res, "Could not process this response. Please check the application ID and try again.");
+        }
+      } catch (err) {
+        return sendTwiML(res, `Error processing response: ${err.message}`);
+      }
+    }
+  }
+
     let { data: landlord, error: fetchError } = await supabase
       .from('landlords')
       .select('*')
@@ -39,7 +77,7 @@ export default async function handler(req, res) {
       }
       return sendTwiML(res, "Welcome to Moveguide! Note: You must be the legal owner/manager. Let’s get started. What is your full name?");
     }
-
+    
     const step = landlord.current_step;
 
     if (step === "NAME") {
