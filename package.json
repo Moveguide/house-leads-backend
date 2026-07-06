@@ -2,11 +2,22 @@
   "name": "house-leads-backend",
   "version": "1.0.0",
   "main": "api/whatsapp.js",
-  "dependencies": {
-    "neo4j-driver": "^5.12.0",
-    "openai": "^4.28.0",
-    "twilio": "^4.19.0",
-    "@supabase/supabase-js": "^2.39.0" 
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
   },
-  "type": "module"
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "neo4j-driver": "^5.12.0",
+    "next": "latest",
+    "node-fetch": "^2.6.7",
+    "openai": "^4.28.0",
+    "twilio": "^4.19.0"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@types/react": "19.2.17",
+    "typescript": "6.0.3"
+  }
 }

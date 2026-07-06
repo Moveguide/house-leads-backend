@@ -4,68 +4,50 @@ import fetch from 'node-fetch';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
 export default async function handler(req, res) {
-  // 1. Handle HTTP preflight options
   if (req.method === 'OPTIONS') return res.status(200).end();
   
-  const payload = req.body;
-
-  // 2. NEW LOGIC: Extract fields from Evolution API JSON layout
-  // Captures both plain text and rich formatting entries
-  const text = (
-    payload.data?.message?.conversation || 
-    payload.data?.message?.extendedTextMessage?.text || 
-    ""
-  ).trim();
-
-  // Extracts the phone string from WhatsApp's global JID string (e.g., "2348123456789@s.whatsapp.net")
-  const remoteJid = payload.data?.key?.remoteJid || "";
-  const phone = remoteJid.split('@')[0].trim();
-
-  // Extracts base64 raw string if an image is sent (Requires "base64: true" enabled in Webhook settings)
-  const base64Media = payload.data?.message?.base64 || null;
-
-  // Guard clause: Avoid loops if the engine echoes our own outgoing texts
-  if (!phone || payload.event === "SEND_MESSAGE") {
-    return res.status(200).json({ status: 'ignored' });
-  }
+  const { Body, From, MediaUrl0 } = req.body;
+  const text = (Body || "").trim();
+  const phone = (From || "").replace("whatsapp:", "").trim();
 
   try {
+
     // Handle application approval/rejection
-    const upperText = text.toUpperCase();
-    if (upperText.startsWith('YES ') || upperText.startsWith('NO ')) {
-      const parts = upperText.split(/\s+/);
-      const decision = parts[0]; // YES or NO
-      const applicationId = parts[1]; // UUID
+const upperText = text.toUpperCase();
+if (upperText.startsWith('YES ') || upperText.startsWith('NO ')) {
+  const parts = upperText.split(/\s+/);
+  const decision = parts[0]; // YES or NO
+  const applicationId = parts[1]; // UUID
 
-      if (applicationId) {
-        try {
-          const response = await fetch('https://app.moveguide.co/api/webhook/whatsapp', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-webhook-secret': process.env.WHATSAPP_WEBHOOK_SECRET,
-            },
-            body: JSON.stringify({
-              message: text,
-              from: phone,
-            }),
-          });
+  if (applicationId) {
+    try {
+        const response = await fetch('https://app.moveguide.co/api/webhook/whatsapp', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-webhook-secret': process.env.WHATSAPP_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify({
+            message: text,
+            from: phone,
+          }),
+        });
 
-          const data = await response.json();
+        const data = await response.json();
 
-          if (data.success) {
-            const confirmMsg = data.status === 'approved'
-              ? '✅ Application approved! The tenant will be notified to make payment.'
-              : '❌ Application rejected. The tenant has been notified.';
-            return await sendMessage(res, phone, confirmMsg);
-          } else {
-            return await sendMessage(res, phone, "Could not process this response. Please check the application ID and try again.");
-          }
-        } catch (err) {
-          return await sendMessage(res, phone, `Error processing response: ${err.message}`);
+        if (data.success) {
+          const confirmMsg = data.status === 'approved'
+            ? '✅ Application approved! The tenant will be notified to make payment.'
+            : '❌ Application rejected. The tenant has been notified.';
+          return sendTwiML(res, confirmMsg);
+        } else {
+          return sendTwiML(res, "Could not process this response. Please check the application ID and try again.");
         }
+      } catch (err) {
+        return sendTwiML(res, `Error processing response: ${err.message}`);
       }
     }
+  }
 
     let { data: landlord, error: fetchError } = await supabase
       .from('landlords')
@@ -79,6 +61,7 @@ export default async function handler(req, res) {
 
     // --- SMART MEMORY CHECK ---
     if (!landlord || isReset) {
+      // If they are already verified, skip the intro and go to ADDRESS
       const startStep = (landlord?.identity_verified) ? "ADDRESS" : "NAME";
       
       const { data: upserted, error: upsertErr } = await supabase
@@ -90,153 +73,128 @@ export default async function handler(req, res) {
       if (upsertErr) throw new Error(`Upsert Fail: ${upsertErr.message}`);
       
       if (landlord?.identity_verified) {
-        return await sendMessage(res, phone, `Welcome back, ${landlord.landlord_name}! What is the full address of the new property?`);
+        return sendTwiML(res, `Welcome back, ${landlord.landlord_name}! What is the full address of the new property?`);
       }
-      return await sendMessage(res, phone, "Welcome to Moveguide! Note: You must be the legal owner/manager. Let’s get started. What is your full name?");
+      return sendTwiML(res, "Welcome to Moveguide! Note: You must be the legal owner/manager. Let’s get started. What is your full name?");
     }
     
     const step = landlord.current_step;
 
     if (step === "NAME") {
       await supabase.from('landlords').update({ landlord_name: text, current_step: "NIN_CAC" }).eq('landlord_phone', phone);
-      return await sendMessage(res, phone, `Thanks! Now, please send your 11-digit NIN or CAC (BN/RC).`);
+      return sendTwiML(res, `Thanks! Now, please send your 11-digit NIN or CAC (BN/RC).`);
     }
 
     if (step === "NIN_CAC") {
       let idData = {};
       if (/^\d{11}$/.test(text)) idData = { nin_number: text };
       else if (/^(BN|RC)/i.test(text)) idData = { cac_number: text.toUpperCase() };
-      else return await sendMessage(res, phone, "Invalid format. Send an 11-digit NIN or a CAC starting with BN/RC.");
+      else return sendTwiML(res, "Invalid format. Send an 11-digit NIN or a CAC starting with BN/RC.");
 
       await supabase.from('landlords').update({ ...idData, current_step: "ID_UPLOAD" }).eq('landlord_phone', phone);
-      return await sendMessage(res, phone, "Got it! Please upload a clear photo of your NIN ID Card.");
+      return sendTwiML(res, "Got it! Please upload a clear photo of your NIN ID Card.");
     }
 
     if (step === "ID_UPLOAD") {
-      if (!base64Media) return await sendMessage(res, phone, "Please send a photo of your NIN ID card to proceed.");
-      const fileUrl = await uploadToSupabase(base64Media, `IDs/${phone}.jpg`);
+      if (!MediaUrl0) return sendTwiML(res, "Please send a photo of your NIN ID card to proceed.");
+      const fileUrl = await uploadToSupabase(MediaUrl0, `IDs/${phone}.jpg`);
       
+      // AUTO-VERIFY: status changes here once file is received
       await supabase.from('landlords')
         .update({ id_card_url: fileUrl, current_step: "ADDRESS", identity_verified: true })
         .eq('landlord_phone', phone);
 
-      return await sendMessage(res, phone, "ID received and account verified! What is the full address of the property?");
+      return sendTwiML(res, "ID received and account verified! What is the full address of the property?");
     }
 
     if (step === "ADDRESS") {
       const { data: prop } = await supabase.from('properties').insert({ landlord_phone: phone, address: text }).select().single();
       await supabase.from('landlords').update({ current_step: "PROOF_UPLOAD", last_property_id: prop.id }).eq('landlord_phone', phone);
-      return await sendMessage(res, phone, "Address saved! Please upload a photo/PDF as Proof of Ownership.");
+      return sendTwiML(res, "Address saved! Please upload a photo/PDF as Proof of Ownership.");
     }
 
     if (step === "PROOF_UPLOAD") {
-      if (!base64Media) return await sendMessage(res, phone, "Please upload a photo of your ownership proof.");
-      const fileUrl = await uploadToSupabase(base64Media, `proofs/${landlord.last_property_id}.jpg`);
+      if (!MediaUrl0) return sendTwiML(res, "Please upload a photo of your ownership proof.");
+      const fileUrl = await uploadToSupabase(MediaUrl0, `proofs/${landlord.last_property_id}.jpg`);
       
       await supabase.from('properties').update({ ownership_proof_url: fileUrl }).eq('id', landlord.last_property_id);
       await supabase.from('landlords').update({ current_step: "PREFERENCES" }).eq('landlord_phone', phone);
-      return await sendMessage(res, phone, "Proof received! Any tenant preferences? Reply 'No' if none.");
+      return sendTwiML(res, "Proof received! Any tenant preferences? Reply 'No' if none.");
     }
 
     if (step === "PREFERENCES") {
       const prefs = text.toLowerCase() === "no" ? { note: "None" } : { note: text };
       await supabase.from('properties').update({ landlord_preferences: prefs }).eq('id', landlord.last_property_id);
       await supabase.from('landlords').update({ current_step: "LISTING_TYPE" }).eq('landlord_phone', phone);
-      return await sendMessage(res, phone, `What type of accommodation is this listing?\n\n1. Short Stay\n2. Tenancy\n3. Hotel\n4. Shared Apartment\n\nReply with the number.`);
+      return sendTwiML(res, `What type of accommodation is this listing?\n\n1. Short Stay\n2. Tenancy\n3. Hotel\n4. Shared Apartment\n\nReply with the number.`);
     }
 
-    if (step === "LISTING_TYPE") {
-      const accommodationMap = {
-        "1": "Short Stay",
-        "2": "Tenancy", 
-        "3": "Hotel",
-        "4": "Shared Apartment",
-        "short stay": "Short Stay",
-        "tenancy": "Tenancy",
-        "hotel": "Hotel",
-        "shared apartment": "Shared Apartment",
-      };
+  if (step === "LISTING_TYPE") {
+    const accommodationMap = {
+      "1": "Short Stay",
+      "2": "Tenancy", 
+      "3": "Hotel",
+      "4": "Shared Apartment",
+      "short stay": "Short Stay",
+      "tenancy": "Tenancy",
+      "hotel": "Hotel",
+      "shared apartment": "Shared Apartment",
+    };
 
-      const accommodationType = accommodationMap[text.toLowerCase()] || accommodationMap[text];
-      if (!accommodationType) {
-        return await sendMessage(res, phone, `Please reply with a number:\n\n1. Short Stay\n2. Tenancy\n3. Hotel\n4. Shared Apartment`);
-      }
-
-      await supabase.from('properties').update({ listing_type: accommodationType }).eq('id', landlord.last_property_id);
-      await supabase.from('landlords').update({ current_step: "CONTRACT_DURATION" }).eq('landlord_phone', phone);
-      return await sendMessage(res, phone, `What is the minimum contract duration?\n\n1. Daily\n2. Monthly\n3. Quarterly\n4. Bi-annually\n5. Annually\n6. 2 Years+\n\nReply with the number.`);
+    const accommodationType = accommodationMap[text.toLowerCase()] || accommodationMap[text];
+    if (!accommodationType) {
+      return sendTwiML(res, `Please reply with a number:\n\n1. Short Stay\n2. Tenancy\n3. Hotel\n4. Shared Apartment`);
     }
 
-    if (step === "CONTRACT_DURATION") {
-      const durationMap = {
-        "1": "Daily",
-        "2": "Monthly",
-        "3": "Quarterly",
-        "4": "Bi-annually",
-        "5": "Annually",
-        "6": "2 Years+",
-        "daily": "Daily",
-        "monthly": "Monthly",
-        "quarterly": "Quarterly",
-        "bi-annually": "Bi-annually",
-        "annually": "Annually",
-        "2 years+": "2 Years+",
-      };
+    await supabase.from('properties').update({ listing_type: accommodationType }).eq('id', landlord.last_property_id);
+    await supabase.from('landlords').update({ current_step: "CONTRACT_DURATION" }).eq('landlord_phone', phone);
+    return sendTwiML(res, `What is the minimum contract duration?\n\n1. Daily\n2. Monthly\n3. Quarterly\n4. Bi-annually\n5. Annually\n6. 2 Years+\n\nReply with the number.`);
+  }
 
-      const contractDuration = durationMap[text.toLowerCase()] || durationMap[text];
-      if (!contractDuration) {
-        return await sendMessage(res, phone, `Please reply with a number:\n\n1. Daily\n2. Monthly\n3. Quarterly\n4. Bi-annually\n5. Annually\n6. 2 Years+`);
-      }
+  if (step === "CONTRACT_DURATION") {
+    const durationMap = {
+      "1": "Daily",
+      "2": "Monthly",
+      "3": "Quarterly",
+      "4": "Bi-annually",
+      "5": "Annually",
+      "6": "2 Years+",
+      "daily": "Daily",
+      "monthly": "Monthly",
+      "quarterly": "Quarterly",
+      "bi-annually": "Bi-annually",
+      "annually": "Annually",
+      "2 years+": "2 Years+",
+    };
 
-      await supabase.from('properties').update({ contract_duration: contractDuration }).eq('id', landlord.last_property_id);
-      await supabase.from('inspections').insert({ property_id: landlord.last_property_id, status: 'assigned' });
-      await supabase.from('landlords').update({ current_step: "DONE" }).eq('landlord_phone', phone);
-      return await sendMessage(res, phone, "Fantastic! Everything is saved. Your property is now queued for inspection in 24 hours. 🎉");
+    const contractDuration = durationMap[text.toLowerCase()] || durationMap[text];
+    if (!contractDuration) {
+      return sendTwiML(res, `Please reply with a number:\n\n1. Daily\n2. Monthly\n3. Quarterly\n4. Bi-annually\n5. Annually\n6. 2 Years+`);
     }
 
-    return await sendMessage(res, phone, "Registration complete! Type 'New Move' to add another residence.");
+    await supabase.from('properties').update({ contract_duration: contractDuration }).eq('id', landlord.last_property_id);
+    await supabase.from('inspections').insert({ property_id: landlord.last_property_id, status: 'assigned' });
+    await supabase.from('landlords').update({ current_step: "DONE" }).eq('landlord_phone', phone);
+    return sendTwiML(res, "Fantastic! Everything is saved. Your property is now queued for inspection in 24 hours. 🎉");
+  }
+
+    return sendTwiML(res, "Registration complete! Type 'New Move' to add another residence.");
 
   } catch (err) {
-    return await sendMessage(res, phone, `System Error: ${err.message}. Type 'Reset' to fix.`);
+    return sendTwiML(res, `System Error: ${err.message}. Type 'Reset' to fix.`);
   }
 }
 
-// 3. NEW LOGIC: Convert Base64 string directly into a file buffer for Supabase
-async function uploadToSupabase(base64String, fileName) {
-  const fileBuffer = Buffer.from(base64String, 'base64');
-  
-  const { data, error } = await supabase.storage
-    .from('landlord-documents')
-    .upload(fileName, fileBuffer, { contentType: 'image/jpeg', upsert: true });
-    
+async function uploadToSupabase(url, fileName) {
+  const response = await fetch(url);
+  const blob = await response.buffer();
+  const { data, error } = await supabase.storage.from('landlord-documents').upload(fileName, blob, { contentType: 'image/jpeg', upsert: true });
   if (error) throw new Error(`Storage Fail: ${error.message}`);
-  
-  const { data: publicUrlData } = supabase.storage.from('landlord-documents').getPublicUrl(fileName);
-  return publicUrlData.publicUrl;
+  const { data: publicUrl } = supabase.storage.from('landlord-documents').getPublicUrl(fileName);
+  return publicUrl.publicUrl;
 }
 
-// 4. NEW LOGIC: Dispatch direct JSON REST request to your API engine
-async function sendMessage(res, phone, msg) {
-  // Acknowledge the engine's webhook post immediately to prevent retries
-  if (!res.headersSent) {
-    res.status(200).json({ success: true });
-  }
-
-  try {
-    const evolutionUrl = process.env.EVOLUTION_API_URL; // e.g. https://your-app.onrender.com
-    const instanceName  = process.env.EVOLUTION_INSTANCE_NAME; // e.g. moveguide-landlords
-    await fetch(`${evolutionUrl}/message/sendText/${instanceName}`, {
-      method: 'POST',
-      headers: {
-        'apikey': process.env.EVOLUTION_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        number: phone,
-        text: msg
-      })
-    });
-  } catch (err) {
-    console.error(`Outbound Message Fail: ${err.message}`);
-  }
+function sendTwiML(res, msg) {
+  res.setHeader('Content-Type', 'text/xml');
+  return res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${msg}</Message></Response>`);
 }
