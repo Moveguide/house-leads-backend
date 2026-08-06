@@ -1,7 +1,11 @@
 import { createClient } from '@supabase/supabase-js';
 import fetch from 'node-fetch';
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY // Service role key allows auth admin operations if needed
+);
+
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 
 // Master list of Nigerian Banks & Microfinance Banks
@@ -129,13 +133,67 @@ export default async function handler(req, res) {
       const fileUrl = await uploadToSupabase(MediaUrl0, `IDs/${phone}.jpg`);
 
       await supabase.from('landlords')
-        .update({ id_card_url: fileUrl, current_step: "BANK_ACCOUNT", identity_verified: true })
+        .update({ id_card_url: fileUrl, current_step: "EMAIL", identity_verified: true })
         .eq('landlord_phone', phone);
 
-      return sendTwiML(res, "ID received! Please enter your 10-digit NUBAN bank account number for payouts.");
+      return sendTwiML(res, "ID received! Please enter your email address for payout notifications & account verification:");
     }
 
-    // --- STEP 5: BANK ACCOUNT NUMBER ---
+    // --- STEP 5: EMAIL COLLECTION & SUPABASE OTP DISPATCH ---
+    if (step === "EMAIL") {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(text)) {
+        return sendTwiML(res, "Invalid email address. Please reply with a valid email (e.g. name@example.com).");
+      }
+
+      const userEmail = text.toLowerCase().trim();
+
+      // Trigger Supabase Auth OTP sending
+      const { error: otpError } = await supabase.auth.signInWithOtp({
+        email: userEmail,
+        options: { shouldCreateUser: true }
+      });
+
+      if (otpError) {
+        return sendTwiML(res, `Failed to send verification code: ${otpError.message}. Please re-enter your email:`);
+      }
+
+      await supabase.from('landlords').update({
+        email: userEmail,
+        current_step: "EMAIL_OTP"
+      }).eq('landlord_phone', phone);
+
+      return sendTwiML(res, `📧 We've sent a 6-digit verification code to *${userEmail}*.\n\nPlease reply here with the 6-digit code:`);
+    }
+
+    // --- STEP 6: SUPABASE EMAIL OTP VERIFICATION ---
+    if (step === "EMAIL_OTP") {
+      const cleanCode = text.replace(/\D/g, '');
+      if (cleanCode.length !== 6) {
+        return sendTwiML(res, "Please enter the valid 6-digit numeric code sent to your email.");
+      }
+
+      // Verify OTP with Supabase Auth
+      const { data, error: verifyError } = await supabase.auth.verifyOtp({
+        email: landlord.email,
+        token: cleanCode,
+        type: 'email',
+      });
+
+      if (verifyError || !data.user) {
+        return sendTwiML(res, "❌ Invalid or expired code. Please check your email and reply with the correct 6-digit code:");
+      }
+
+      // Mark email as verified in database and move to bank setup
+      await supabase.from('landlords').update({
+        email_verified: true,
+        current_step: "BANK_ACCOUNT"
+      }).eq('landlord_phone', phone);
+
+      return sendTwiML(res, "✅ Email verified successfully!\n\nNow, enter your 10-digit NUBAN bank account number for payouts:");
+    }
+
+    // --- STEP 7: BANK ACCOUNT NUMBER ---
     if (step === "BANK_ACCOUNT") {
       const accNo = text.replace(/\D/g, '');
       if (accNo.length !== 10) {
@@ -146,11 +204,10 @@ export default async function handler(req, res) {
       return sendTwiML(res, "Account number saved!\n\nPlease type the first 3 or 4 letters of your bank's name (e.g. *GTB*, *Zen*, *Mon*, *Opa*, *Acc*, *FCM*):");
     }
 
-    // --- STEP 6: DYNAMIC BANK SEARCH & PAYSTACK RESOLVE ---
+    // --- STEP 8: DYNAMIC BANK SEARCH & PAYSTACK RESOLVE ---
     if (step === "BANK_SEARCH" || step === "BANK_SELECT") {
       const searchKey = text.toLowerCase().trim();
 
-      // Filter bank candidates matching search text
       const matches = NIGERIAN_BANKS.filter(b => 
         b.name.toLowerCase().includes(searchKey) || 
         b.code === searchKey
@@ -160,9 +217,8 @@ export default async function handler(req, res) {
         return sendTwiML(res, `No bank found matching "${text}".\n\nPlease try typing the first 3 letters of your bank again (e.g., GTB, Access, Kuda, Zenith).`);
       }
 
-      // If multiple bank choices match (e.g. "Access"), prompt a brief list
       if (matches.length > 1 && !/^\d+$/.test(text)) {
-        let optionsMsg = `Found ${matches.length} matching banks. Please type the exact name or letter keyword:\n\n`;
+        let optionsMsg = `Found ${matches.length} matching banks. Please type the exact bank name:\n\n`;
         matches.slice(0, 5).forEach((b) => {
           optionsMsg += `• ${b.name}\n`;
         });
@@ -177,11 +233,10 @@ export default async function handler(req, res) {
       if (!verification.success) {
         return sendTwiML(
           res,
-          `⚠️ Account Verification Failed\n\nCould not verify account ${landlord.account_number} with *${selectedBank.name}*.\nReason: ${verification.message}\n\nPlease type another bank name, or reply 'Reset' to re-enter your account number.`
+          `⚠️ Account Verification Failed\n\nCould not verify account ${landlord.account_number} with *${selectedBank.name}*.\nReason: ${verification.message}\n\nPlease type another bank name, or reply 'Reset' to start over.`
         );
       }
 
-      // Save verified account details to database
       await supabase.from('landlords').update({
         bank_code: selectedBank.code,
         bank_name: selectedBank.name,
@@ -195,7 +250,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // --- STEP 7: ADDRESS ---
+    // --- STEP 9: ADDRESS ---
     if (step === "ADDRESS") {
       const { data: prop } = await supabase.from('properties').insert({
         landlord_phone: phone,
@@ -208,7 +263,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, "Address saved!\n\nWhat is the building type?\n\n1. Bungalow\n2. Duplex\n3. Terrace\n\nReply with the number.");
     }
 
-    // --- STEP 8: BUILDING TYPE ---
+    // --- STEP 10: BUILDING TYPE ---
     if (step === "BUILDING_TYPE") {
       const map = { "1": "Bungalow", "2": "Duplex", "3": "Terrace" };
       const selected = map[text];
@@ -220,7 +275,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, "What is the stay capacity?\n\n1. Miniflat\n2. 1 Bed\n3. 2 Bed\n4. 3 Bed\n5. 4 Bed\n6. 5 Bed\n\nReply with the number.");
     }
 
-    // --- STEP 9: STAY CAPACITY ---
+    // --- STEP 11: STAY CAPACITY ---
     if (step === "STAY_CAPACITY") {
       const map = { "1": "Miniflat", "2": "1 Bed", "3": "2 Bed", "4": "3 Bed", "5": "4 Bed", "6": "5 Bed" };
       const selected = map[text];
@@ -232,7 +287,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, "What is the stay type?\n\n1. Solo Tenancy\n2. Shared Flat\n\nReply with the number.");
     }
 
-    // --- STEP 10: STAY TYPE ---
+    // --- STEP 12: STAY TYPE ---
     if (step === "STAY_TYPE") {
       const map = { "1": "Solo Tenancy", "2": "Shared Flat" };
       const selected = map[text];
@@ -244,7 +299,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, "Is this property in a shared building/compound?\n\n1. Yes\n2. No\n\nReply with the number.");
     }
 
-    // --- STEP 11: SHARED BUILDING ---
+    // --- STEP 13: SHARED BUILDING ---
     if (step === "SHARED_BUILDING") {
       const map = { "1": true, "2": false };
       const selected = map[text];
@@ -256,7 +311,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, "What is the minimum contract duration?\n\n1. Daily\n2. Monthly\n3. Quarterly\n4. Annually\n\nReply with the number.");
     }
 
-    // --- STEP 12: CONTRACT DURATION ---
+    // --- STEP 14: CONTRACT DURATION ---
     if (step === "CONTRACT_DURATION") {
       const map = { "1": "Daily", "2": "Monthly", "3": "Quarterly", "4": "Annually" };
       const selected = map[text];
@@ -268,7 +323,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, "What is the total price for this stay in NGN (inclusive of service charges/fees if any)?\nExample: 1,500,000 or 1500000");
     }
 
-    // --- STEP 13: AMOUNT NORMALIZATION ---
+    // --- STEP 15: AMOUNT NORMALIZATION ---
     if (step === "AMOUNT") {
       const rawPrice = text.replace(/[^0-9.]/g, '');
       const parsedPrice = parseFloat(rawPrice);
@@ -283,7 +338,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, `Amount saved as ₦${parsedPrice.toLocaleString('en-NG')}.\n\nPlease upload a photo or document as Proof of Ownership.`);
     }
 
-    // --- STEP 14: PROOF UPLOAD ---
+    // --- STEP 16: PROOF UPLOAD ---
     if (step === "PROOF_UPLOAD") {
       if (!MediaUrl0) return sendTwiML(res, "Please upload a photo of your ownership proof.");
       const fileUrl = await uploadToSupabase(MediaUrl0, `proofs/${landlord.last_property_id}.jpg`);
@@ -291,10 +346,10 @@ export default async function handler(req, res) {
       await supabase.from('properties').update({ ownership_proof_url: fileUrl }).eq('id', landlord.last_property_id);
       await supabase.from('landlords').update({ current_step: "PREFERENCES" }).eq('landlord_phone', phone);
 
-      return sendTwiML(res, "Proof received! Any specific tenant preferences (e.g., gender preferences, no pets)? Reply 'No' if none.");
+      return sendTwiML(res, "Proof received! Any specific tenant preferences (English) (e.g., gender preferences, no pets)? Reply 'No' if none.");
     }
 
-    // --- STEP 15: PREFERENCES & COMPLETION ---
+    // --- STEP 17: PREFERENCES & COMPLETION ---
     if (step === "PREFERENCES") {
       const prefs = text.toLowerCase() === "no" ? { note: "None" } : { note: text };
       await supabase.from('properties').update({ landlord_preferences: prefs }).eq('id', landlord.last_property_id);
