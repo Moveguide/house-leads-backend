@@ -4,12 +4,13 @@ import fetch from 'node-fetch';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 
+// Standard Paystack Bank Codes for Nigeria
 const POPULAR_BANKS = [
   { code: "011", name: "First Bank of Nigeria" },
   { code: "058", name: "GTBank" },
   { code: "057", name: "Zenith Bank" },
   { code: "044", name: "Access Bank" },
-  { code: "90115", name: "OPay" },
+  { code: "999992", name: "OPay" },
   { code: "50515", name: "Moniepoint" },
   { code: "50211", name: "Kuda Bank" },
   { code: "214", name: "First City Monument Bank" }
@@ -18,7 +19,7 @@ const POPULAR_BANKS = [
 export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const { Body, From, MediaUrl0 } = req.body;
+  const { Body, From, MediaUrl0 } = req.body || {};
   const text = (Body || "").trim();
   const phone = (From || "").replace("whatsapp:", "").trim();
 
@@ -129,7 +130,7 @@ export default async function handler(req, res) {
       return sendTwiML(res, menu);
     }
 
-    // --- STEP 6: BANK SELECT & PAYSTACK RESOLVE ---
+    // --- STEP 6: BANK SELECT & PAYSTACK LIVE VERIFICATION ---
     if (step === "BANK_SELECT") {
       const index = parseInt(text, 10) - 1;
       if (isNaN(index) || index < 0 || index >= POPULAR_BANKS.length) {
@@ -137,20 +138,29 @@ export default async function handler(req, res) {
       }
 
       const selectedBank = POPULAR_BANKS[index];
-      const accountHolder = await resolvePaystackAccount(landlord.account_number, selectedBank.code);
+      
+      // Perform strict account verification via Paystack
+      const verification = await resolvePaystackAccount(landlord.account_number, selectedBank.code);
 
+      if (!verification.success) {
+        return sendTwiML(
+          res,
+          `⚠️ Account Verification Failed\n\nCould not verify account ${landlord.account_number} with ${selectedBank.name}.\nReason: ${verification.message}\n\nPlease check your account number or select the correct bank. Reply 'Reset' to start over.`
+        );
+      }
+
+      // Save verified details and advance step
       await supabase.from('landlords').update({
         bank_code: selectedBank.code,
         bank_name: selectedBank.name,
-        account_name: accountHolder || "Unverified",
+        account_name: verification.accountName,
         current_step: "ADDRESS"
       }).eq('landlord_phone', phone);
 
-      const confirmMsg = accountHolder
-        ? `Account Verified: *${accountHolder}* (${selectedBank.name})\n\nWhat is the full address of the property?`
-        : `Bank saved (${selectedBank.name}). What is the full address of the property?`;
-
-      return sendTwiML(res, confirmMsg);
+      return sendTwiML(
+        res,
+        `✅ Account Verified!\n*Account Name:* ${verification.accountName}\n*Bank:* ${selectedBank.name}\n\nWhat is the full address of the property?`
+      );
     }
 
     // --- STEP 7: ADDRESS ---
@@ -265,36 +275,82 @@ export default async function handler(req, res) {
     return sendTwiML(res, "Registration complete! Type 'New Move' to add another residence.");
 
   } catch (err) {
+    console.error("Webhook processing error:", err);
     return sendTwiML(res, `System Error: ${err.message}. Type 'Reset' to restart.`);
   }
 }
 
+/**
+ * Paystack API NUBAN Account Resolution Helper
+ */
 async function resolvePaystackAccount(accountNumber, bankCode) {
-  if (!PAYSTACK_SECRET) return null;
-  try {
-    const res = await fetch(`https://api.paystack.co/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` }
-    });
-    const data = await res.json();
-    if (data.status && data.data) {
-      return data.data.account_name;
-    }
-  } catch (e) {
-    console.error("Paystack resolution error:", e.message);
+  if (!PAYSTACK_SECRET) {
+    console.error("PAYSTACK_SECRET_KEY environment variable is not defined.");
+    return { success: false, message: "Paystack secret key is missing." };
   }
-  return null;
+
+  try {
+    const url = `https://api.paystack.co/bank/resolve?account_number=${encodeURIComponent(accountNumber)}&bank_code=${encodeURIComponent(bankCode)}`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${PAYSTACK_SECRET}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const data = await res.json();
+
+    if (data.status && data.data) {
+      return {
+        success: true,
+        accountName: data.data.account_name,
+        accountNumber: data.data.account_number,
+      };
+    }
+
+    return {
+      success: false,
+      message: data.message || "Account details could not be resolved.",
+    };
+  } catch (e) {
+    console.error("Paystack Resolution HTTP Error:", e.message);
+    return { success: false, message: e.message };
+  }
 }
 
+/**
+ * Supabase Storage File Upload Helper
+ */
 async function uploadToSupabase(url, fileName) {
   const response = await fetch(url);
-  const blob = await response.buffer();
-  const { error } = await supabase.storage.from('landlord-documents').upload(fileName, blob, { contentType: 'image/jpeg', upsert: true });
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  const { error } = await supabase.storage
+    .from('landlord-documents')
+    .upload(fileName, buffer, { contentType: 'image/jpeg', upsert: true });
+
   if (error) throw new Error(`Storage Fail: ${error.message}`);
-  const { data: publicUrl } = supabase.storage.from('landlord-documents').getPublicUrl(fileName);
+  
+  const { data: publicUrl } = supabase.storage
+    .from('landlord-documents')
+    .getPublicUrl(fileName);
+
   return publicUrl.publicUrl;
 }
 
+/**
+ * XML Safe TwiML Messaging Helper
+ */
 function sendTwiML(res, msg) {
+  const escapedMsg = msg
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+
   res.setHeader('Content-Type', 'text/xml');
-  return res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${msg}</Message></Response>`);
+  return res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapedMsg}</Message></Response>`);
 }
