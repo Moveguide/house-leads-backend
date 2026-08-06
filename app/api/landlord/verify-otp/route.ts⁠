@@ -2,41 +2,48 @@ import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
 export async function POST(req: Request) {
   try {
-    const { landlordPhone, code } = await req.json();
+    const { email, code } = await req.json();
 
-    const { data: landlord, error } = await supabase
-      .from('landlords')
-      .select('verification_code, code_expires_at')
-      .eq('landlord_phone', landlordPhone)
-      .single();
-
-    if (error || !landlord) {
-      return NextResponse.json({ message: 'Landlord record not found' }, { status: 404 });
+    if (!email || !code) {
+      return NextResponse.json({ message: 'Email and verification code are required' }, { status: 400 });
     }
 
-    // Check code validity & expiration
-    const isExpired = new Date(landlord.code_expires_at) < new Date();
-    if (landlord.verification_code !== code || isExpired) {
+    // Verify the OTP code with Supabase Auth
+    const { data, error } = await supabase.auth.verifyOtp({
+      email: email.toLowerCase().trim(),
+      token: code,
+      type: 'email',
+    });
+
+    if (error) {
       return NextResponse.json({ message: 'Invalid or expired verification code' }, { status: 400 });
     }
 
-    // Mark email as verified and clear OTP
-    await supabase
-      .from('landlords')
-      .update({
-        email_verified: true,
-        verification_code: null,
-        code_expires_at: null,
-      })
-      .eq('landlord_phone', landlordPhone);
+    const userId = data.user?.id;
 
-    return NextResponse.json({ status: 'success', message: 'Email verified successfully' });
+    // Optional: Sync landlord record in your 'landlords' table
+    if (userId) {
+      await supabase
+        .from('landlords')
+        .upsert({
+          id: userId,
+          email: email.toLowerCase().trim(),
+          email_verified: true,
+          updated_at: new Date().toISOString(),
+        });
+    }
+
+    return NextResponse.json({
+      status: 'success',
+      message: 'Email verified successfully',
+      user: data.user,
+    });
   } catch (err: any) {
     return NextResponse.json({ message: err.message }, { status: 500 });
   }
