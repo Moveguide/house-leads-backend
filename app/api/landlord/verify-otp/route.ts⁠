@@ -1,0 +1,43 @@
+import { NextResponse } from 'next/server';
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
+
+export async function POST(req: Request) {
+  try {
+    const { landlordPhone, code } = await req.json();
+
+    const { data: landlord, error } = await supabase
+      .from('landlords')
+      .select('verification_code, code_expires_at')
+      .eq('landlord_phone', landlordPhone)
+      .single();
+
+    if (error || !landlord) {
+      return NextResponse.json({ message: 'Landlord record not found' }, { status: 404 });
+    }
+
+    // Check code validity & expiration
+    const isExpired = new Date(landlord.code_expires_at) < new Date();
+    if (landlord.verification_code !== code || isExpired) {
+      return NextResponse.json({ message: 'Invalid or expired verification code' }, { status: 400 });
+    }
+
+    // Mark email as verified and clear OTP
+    await supabase
+      .from('landlords')
+      .update({
+        email_verified: true,
+        verification_code: null,
+        code_expires_at: null,
+      })
+      .eq('landlord_phone', landlordPhone);
+
+    return NextResponse.json({ status: 'success', message: 'Email verified successfully' });
+  } catch (err: any) {
+    return NextResponse.json({ message: err.message }, { status: 500 });
+  }
+}
