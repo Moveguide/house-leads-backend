@@ -1,11 +1,14 @@
 import { NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
+import { Resend } from 'resend';
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
+
+const resend = new Resend(process.env.RESEND_API_KEY!);
 
 export async function POST(req: Request) {
   try {
@@ -43,7 +46,6 @@ export async function POST(req: Request) {
           break;
 
         default:
-          // Fallback handler for existing/untyped legacy payments
           await handleDefaultPayment(paymentData);
           break;
       }
@@ -84,16 +86,27 @@ async function handleRentPayment(paymentData: any) {
       .select('*, properties(*, landlords(*))')
       .single();
 
-    // 3. Notify Landlord via Twilio WhatsApp API
-    const landlordPhone = app?.properties?.landlords?.landlord_phone;
-    if (landlordPhone) {
-      await sendWhatsAppNotification(
-        landlordPhone,
-        `🎉 *Rent Payment Received!*\n\n` +
-          `Property: *${app.properties.address}*\n` +
-          `Amount: ₦${amountPaid.toLocaleString('en-NG')}\n` +
-          `Ref: ${reference}`
-      );
+    const landlord = app?.properties?.landlords;
+    const address = app?.properties?.address || 'your property';
+
+    // 3. Dispatch Email Alert to Landlord via Resend
+    if (landlord?.email) {
+      await resend.emails.send({
+        from: 'Moveguide Payments <payments@moveguide.co>',
+        to: [landlord.email],
+        subject: `Rent Payment Received - ${address}`,
+        html: `
+          <div style="font-family: sans-serif; line-height: 1.6;">
+            <h2>Rent Payment Confirmed</h2>
+            <p>Rent for <strong>${address}</strong> has been received successfully.</p>
+            <ul>
+              <li><strong>Amount Paid:</strong> ₦${amountPaid.toLocaleString('en-NG')}</li>
+              <li><strong>Payment Reference:</strong> ${reference}</li>
+            </ul>
+            <p>The payout is being processed to your registered account.</p>
+          </div>
+        `,
+      });
     }
   }
 }
@@ -118,32 +131,4 @@ async function handleUserAppSubscription(paymentData: any) {
  */
 async function handleDefaultPayment(paymentData: any) {
   console.log('Processed untyped payment:', paymentData.reference);
-}
-
-/**
- * Twilio WhatsApp Alert Helper
- */
-async function sendWhatsAppNotification(toPhone: string, messageBody: string) {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  const fromPhone = process.env.TWILIO_WHATSAPP_NUMBER;
-
-  if (!accountSid || !authToken || !fromPhone) return;
-
-  const formattedTo = toPhone.startsWith('whatsapp:') ? toPhone : `whatsapp:${toPhone}`;
-
-  const params = new URLSearchParams({
-    To: formattedTo,
-    From: fromPhone,
-    Body: messageBody,
-  });
-
-  await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${Buffer.from(`${accountSid}:${authToken}`).toString('base64')}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: params.toString(),
-  });
 }
