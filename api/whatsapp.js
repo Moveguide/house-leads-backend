@@ -4,16 +4,36 @@ import fetch from 'node-fetch';
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
 
-// Standard Paystack Bank Codes for Nigeria
-const POPULAR_BANKS = [
-  { code: "011", name: "First Bank of Nigeria" },
-  { code: "058", name: "GTBank" },
-  { code: "057", name: "Zenith Bank" },
+// Master list of Nigerian Banks & Microfinance Banks
+const NIGERIAN_BANKS = [
   { code: "044", name: "Access Bank" },
-  { code: "999992", name: "OPay" },
-  { code: "50515", name: "Moniepoint" },
+  { code: "063", name: "Access Bank (Diamond)" },
+  { code: "035A", name: "ALAT by Wema" },
+  { code: "023", name: "Citibank Nigeria" },
+  { code: "050", name: "Ecobank Nigeria" },
+  { code: "084", name: "Enterprise Bank" },
+  { code: "070", name: "Fidelity Bank" },
+  { code: "011", name: "First Bank of Nigeria" },
+  { code: "214", name: "First City Monument Bank (FCMB)" },
+  { code: "058", name: "GTBank" },
+  { code: "030", name: "Heritage Bank" },
+  { code: "301", name: "Jaiz Bank" },
+  { code: "082", name: "Keystone Bank" },
   { code: "50211", name: "Kuda Bank" },
-  { code: "214", name: "First City Monument Bank" }
+  { code: "50515", name: "Moniepoint MFB" },
+  { code: "999992", name: "OPay Digital Services" },
+  { code: "999991", name: "PalmPay" },
+  { code: "076", name: "Polaris Bank" },
+  { code: "101", name: "Providus Bank" },
+  { code: "221", name: "Stanbic IBTC Bank" },
+  { code: "068", name: "Standard Chartered Bank" },
+  { code: "232", name: "Sterling Bank" },
+  { code: "100", name: "SunTrust Bank" },
+  { code: "032", name: "Union Bank of Nigeria" },
+  { code: "033", name: "United Bank for Africa (UBA)" },
+  { code: "215", name: "Unity Bank" },
+  { code: "035", name: "Wema Bank" },
+  { code: "057", name: "Zenith Bank" }
 ];
 
 export default async function handler(req, res) {
@@ -112,44 +132,56 @@ export default async function handler(req, res) {
         .update({ id_card_url: fileUrl, current_step: "BANK_ACCOUNT", identity_verified: true })
         .eq('landlord_phone', phone);
 
-      return sendTwiML(res, "ID received and verified! Please enter your 10-digit NUBAN account number for payouts.");
+      return sendTwiML(res, "ID received! Please enter your 10-digit NUBAN bank account number for payouts.");
     }
 
     // --- STEP 5: BANK ACCOUNT NUMBER ---
     if (step === "BANK_ACCOUNT") {
       const accNo = text.replace(/\D/g, '');
       if (accNo.length !== 10) {
-        return sendTwiML(res, "Please send a valid 10-digit bank account number.");
+        return sendTwiML(res, "Please enter a valid 10-digit NUBAN bank account number.");
       }
-      await supabase.from('landlords').update({ account_number: accNo, current_step: "BANK_SELECT" }).eq('landlord_phone', phone);
+      await supabase.from('landlords').update({ account_number: accNo, current_step: "BANK_SEARCH" }).eq('landlord_phone', phone);
 
-      let menu = "Select your bank by replying with the number:\n\n";
-      POPULAR_BANKS.forEach((b, idx) => {
-        menu += `${idx + 1}. ${b.name}\n`;
-      });
-      return sendTwiML(res, menu);
+      return sendTwiML(res, "Account number saved!\n\nPlease type the first 3 or 4 letters of your bank's name (e.g. *GTB*, *Zen*, *Mon*, *Opa*, *Acc*, *FCM*):");
     }
 
-    // --- STEP 6: BANK SELECT & PAYSTACK LIVE VERIFICATION ---
-    if (step === "BANK_SELECT") {
-      const index = parseInt(text, 10) - 1;
-      if (isNaN(index) || index < 0 || index >= POPULAR_BANKS.length) {
-        return sendTwiML(res, "Invalid choice. Reply with a valid number from the list.");
+    // --- STEP 6: DYNAMIC BANK SEARCH & PAYSTACK RESOLVE ---
+    if (step === "BANK_SEARCH" || step === "BANK_SELECT") {
+      const searchKey = text.toLowerCase().trim();
+
+      // Filter bank candidates matching search text
+      const matches = NIGERIAN_BANKS.filter(b => 
+        b.name.toLowerCase().includes(searchKey) || 
+        b.code === searchKey
+      );
+
+      if (matches.length === 0) {
+        return sendTwiML(res, `No bank found matching "${text}".\n\nPlease try typing the first 3 letters of your bank again (e.g., GTB, Access, Kuda, Zenith).`);
       }
 
-      const selectedBank = POPULAR_BANKS[index];
-      
-      // Perform strict account verification via Paystack
+      // If multiple bank choices match (e.g. "Access"), prompt a brief list
+      if (matches.length > 1 && !/^\d+$/.test(text)) {
+        let optionsMsg = `Found ${matches.length} matching banks. Please type the exact name or letter keyword:\n\n`;
+        matches.slice(0, 5).forEach((b) => {
+          optionsMsg += `• ${b.name}\n`;
+        });
+        return sendTwiML(res, optionsMsg);
+      }
+
+      const selectedBank = matches[0];
+
+      // Perform live account verification call with Paystack API
       const verification = await resolvePaystackAccount(landlord.account_number, selectedBank.code);
 
       if (!verification.success) {
         return sendTwiML(
           res,
-          `⚠️ Account Verification Failed\n\nCould not verify account ${landlord.account_number} with ${selectedBank.name}.\nReason: ${verification.message}\n\nPlease check your account number or select the correct bank. Reply 'Reset' to start over.`
+          `⚠️ Account Verification Failed\n\nCould not verify account ${landlord.account_number} with *${selectedBank.name}*.\nReason: ${verification.message}\n\nPlease type another bank name, or reply 'Reset' to re-enter your account number.`
         );
       }
 
-      // Save verified details and advance step
+      // Save verified account details to database
       await supabase.from('landlords').update({
         bank_code: selectedBank.code,
         bank_name: selectedBank.name,
@@ -285,8 +317,8 @@ export default async function handler(req, res) {
  */
 async function resolvePaystackAccount(accountNumber, bankCode) {
   if (!PAYSTACK_SECRET) {
-    console.error("PAYSTACK_SECRET_KEY environment variable is not defined.");
-    return { success: false, message: "Paystack secret key is missing." };
+    console.error("PAYSTACK_SECRET_KEY is not defined in environment variables.");
+    return { success: false, message: "Paystack API key missing." };
   }
 
   try {
@@ -314,7 +346,7 @@ async function resolvePaystackAccount(accountNumber, bankCode) {
       message: data.message || "Account details could not be resolved.",
     };
   } catch (e) {
-    console.error("Paystack Resolution HTTP Error:", e.message);
+    console.error("Paystack Resolution Error:", e.message);
     return { success: false, message: e.message };
   }
 }
